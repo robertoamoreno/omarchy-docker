@@ -1,0 +1,172 @@
+# shellcheck shell=bash
+# =============================================================================
+# /etc/omarchy-container/env — runtime configuration for omarchy:4.0.1
+# =============================================================================
+#
+# Sourced by /usr/local/bin/omarchy-container-init before anything starts.
+# Pure data: assignments and comments only. No commands, no `set`, no side
+# effects — it is sourced into PID 1.
+#
+# Every value uses `${VAR:-default}`, so anything passed with `docker run -e`
+# WINS. To change a default permanently, edit this file in the image or shadow
+# it with a bind mount. To override just a few values without rewriting this
+# file, drop a second file at /etc/omarchy-container/env.local — the entrypoint
+# sources it afterwards if it exists:
+#
+#   docker run -v ./my-env:/etc/omarchy-container/env.local:ro ...
+#
+# -----------------------------------------------------------------------------
+# WHY THIS FILE EXISTS AT ALL, AND NOT ~/.config/uwsm/env-hyprland
+# -----------------------------------------------------------------------------
+# On a real Omarchy install the session is started by `uwsm start hyprland`, and
+# uwsm exports the environment below by reading ~/.config/uwsm/env-hyprland and
+# pushing it into the systemd *user manager*. That machinery cannot work here:
+#
+#   * uwsm is a wrapper around `systemctl --user` / `systemd-run --user`. It
+#     waits on graphical-session-pre.target and friends.
+#   * This container has no systemd, no user manager, no /run/systemd, and no
+#     D-Bus system bus. `systemctl --user` fails with "Failed to connect to bus".
+#   * There is also no sddm to invoke uwsm in the first place — sddm is
+#     deliberately excluded from the image (it would drag in the whole
+#     xorg-server), so nothing in /usr/share/omarchy/install starts a session.
+#
+# So the entrypoint launches the compositor binary DIRECTLY and exports this
+# environment into its own process, which the compositor and every app it
+# spawns then inherit. That is functionally what uwsm would have achieved; it
+# just skips the systemd round trip. Do not "fix" this by calling uwsm.
+#
+# Note that ~/.config/uwsm/env-hyprland, if the omarchy packages ship one, is
+# simply never read. If you want to add environment for the session, add it
+# here or in env.local.
+# =============================================================================
+
+
+# --- display -----------------------------------------------------------------
+# Geometry of the single headless output, WIDTHxHEIGHT[@REFRESH].
+# The refresh rate is cosmetic under software rendering; llvmpipe will not hit
+# 60 fps on a real desktop scene. 1920x1080 is ~8.3 MB per frame uncompressed,
+# which is also the VNC bandwidth story — drop to 1600x900 or 1280x800 if the
+# connection feels sluggish.
+export OMARCHY_RESOLUTION="${OMARCHY_RESOLUTION:-1920x1080}"
+
+
+# --- VNC (wayvnc) ------------------------------------------------------------
+export OMARCHY_VNC_PORT="${OMARCHY_VNC_PORT:-5900}"
+
+# Bind address for wayvnc. 0.0.0.0 is the frozen default because the whole point
+# is to reach it from the host via -p 5900:5900. Set it to 127.0.0.1 to expose
+# the desktop ONLY through the noVNC bridge.
+export OMARCHY_VNC_ADDRESS="${OMARCHY_VNC_ADDRESS:-0.0.0.0}"
+
+# Empty (the default) = NO AUTHENTICATION. Anything that can reach the port gets
+# the desktop, with a passwordless-sudo shell one keybind away. That is fine on
+# a laptop with -p 127.0.0.1:5900:5900 and nowhere else. Publish this container
+# on a routable address and you have published a root shell.
+#
+# Setting a password turns on wayvnc's `enable_auth`. Be aware that wayvnc's
+# authenticated security types (VeNCrypt / RSA-AES) need key material, and not
+# every VNC client speaks them — if wayvnc refuses to start with a password set,
+# the entrypoint reports its log and exits rather than silently dropping to
+# no-auth. The robust alternative is to leave this empty and put the port behind
+# an SSH tunnel or a reverse proxy that does the authentication.
+# The entrypoint removes this from the EXPORTED environment once it has read it
+# (`export -n`), so it does not end up in the environment of every app running in
+# the desktop. It is written into the generated wayvnc config, which is 0600.
+OMARCHY_VNC_PASSWORD="${OMARCHY_VNC_PASSWORD:-}"
+
+# Username paired with OMARCHY_VNC_PASSWORD. Ignored when no password is set.
+export OMARCHY_VNC_USERNAME="${OMARCHY_VNC_USERNAME:-omarchy}"
+
+
+# --- Omarchy shell -----------------------------------------------------------
+# 1 = start quickshell running $OMARCHY_PATH/shell, which is Omarchy's actual
+# desktop UI: the bar, the menu, the panels, and the IPC endpoint that
+# `omarchy plugin list` / `omarchy menu` talk to. With it off those commands
+# answer "omarchy-shell is not running".
+#
+# Under the sway fallback the shell loads and the bar renders, but widgets that
+# need things a container has no access to are inert: workspaces/windows (no
+# $HYPRLAND_INSTANCE_SIGNATURE), network, bluetooth and battery (no system
+# D-Bus), audio (no pipewire daemon). Set to 0 for a bare compositor.
+OMARCHY_SHELL="${OMARCHY_SHELL:-1}"
+
+# Root of the Omarchy tree the shell and its scripts read.
+export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+
+
+# --- noVNC (browser client) --------------------------------------------------
+# 1 = also run websockify serving the vendored noVNC, so the desktop is reachable
+# at http://<host>:6080/vnc.html with no VNC client installed.
+#
+# Neither `novnc` nor `python-websockify` exists in the ISO's [offline] mirror or
+# in the pinned ALA snapshot, so build-image.sh vendors both from their GitHub
+# releases into /usr/share/novnc and /usr/share/websockify. If that step did not
+# run, the entrypoint logs a warning and carries on with VNC only — it will not
+# kill the container over a missing browser client.
+export OMARCHY_ENABLE_NOVNC="${OMARCHY_ENABLE_NOVNC:-1}"
+export OMARCHY_NOVNC_PORT="${OMARCHY_NOVNC_PORT:-6080}"
+export OMARCHY_NOVNC_ADDRESS="${OMARCHY_NOVNC_ADDRESS:-0.0.0.0}"
+
+
+# --- compositor selection ----------------------------------------------------
+# auto     probe for a usable DRM node; Hyprland if there is one, the wlroots
+#          fallback if there is not. Says which and why, loudly.
+# hyprland force real Hyprland. Fails on a host with no DRM node — see below.
+# sway     force the wlroots fallback (also accepts: labwc, cage).
+#
+# WHY A FALLBACK EXISTS. Hyprland 0.56.2 uses aquamarine 0.14.0, and aquamarine
+# cannot start without a GBM-capable DRM node, headless or not:
+#
+#   Headless.cpp:132-138  CHeadlessBackend::drmFD() returns -1 unconditionally
+#   Backend.cpp:162-178   the GBM allocator is built ONLY from an implementation
+#                         with drmFD() >= 0; otherwise it logs
+#                         "Cannot open backend: no allocator available" and fails
+#   Compositor.cpp:311-319 (Hyprland) requests HEADLESS/DRM/WAYLAND and never
+#                         AQ_BACKEND_NULL, the only type that skips that check
+#
+# There is no environment variable or flag that works around it. "Headless" is
+# not a GPU-free mode. Docker Desktop's linuxkit VM on macOS has no /dev/dri and
+# no virtual DRM driver to load (CONFIG_DRM_VKMS / VGEM / SIMPLEDRM / UDMABUF are
+# all unset), so Hyprland cannot run there at all.
+#
+# To get REAL Hyprland, give the container a DRM node:
+#   on the host:   sudo modprobe vkms          # if there is no real GPU
+#   then:          docker run --device /dev/dri --group-add video ...
+# Any x86_64 Linux host works — bare metal, a cloud VM, GitHub Actions
+# ubuntu-latest, or Lima/Colima on this Mac. The image needs no changes; this
+# entrypoint detects the node and starts Hyprland instead of the fallback.
+export OMARCHY_COMPOSITOR="${OMARCHY_COMPOSITOR:-auto}"
+
+
+# --- supervision -------------------------------------------------------------
+# Seconds to wait for the compositor's Wayland socket and for it to report an
+# output. Software rendering under Rosetta on an arm64 Mac is slow; 60s is
+# generous on real hardware and about right under emulation. On a timeout the
+# entrypoint exits non-zero and prints the compositor's log — it never hangs.
+export OMARCHY_STARTUP_TIMEOUT="${OMARCHY_STARTUP_TIMEOUT:-60}"
+
+# 1 = verbose. Raises wayvnc to -L debug. Hyprland's own stdout logging is
+# already forced on in hyprland.conf (debug:enable_stdout_logs), because without
+# it Hyprland writes nothing at all on an early abort and every failure looks
+# like a config error.
+export OMARCHY_DEBUG="${OMARCHY_DEBUG:-0}"
+
+
+# --- session environment -----------------------------------------------------
+# These are the variables uwsm would have exported. The entrypoint sets the
+# full set itself (see export_common_env / export_hyprland_env / export_wlroots_env
+# in /usr/local/bin/omarchy-container-init); only override them here if you know
+# why. The two that matter most:
+#
+#   LIBGL_ALWAYS_SOFTWARE=1   llvmpipe. There is no GPU. Unsetting this makes
+#                             GL clients fail rather than fall back.
+#   WLR_LIBINPUT_NO_DEVICES=1 no input devices are ever present; without it a
+#                             wlroots compositor refuses to start.
+#
+# Locale: the build prunes /usr/share/locale to en*, so do not set a non-English
+# LANG here and expect translations.
+export LANG="${LANG:-en_US.UTF-8}"
+export TZ="${TZ:-UTC}"
+
+# Terminal used by the compositor keybind and by the autostart script.
+export OMARCHY_TERMINAL="${OMARCHY_TERMINAL:-foot}"

@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# The ISO. ~5.8 GB, and not ours to redistribute -- Omarchy publishes its own
+# releases. Everything in this repo is built FROM it; nothing here contains it.
+# Put your own copy in the repo root as omarchy-4.0.1.iso.
+# ---------------------------------------------------------------------------
+*.iso
+
+# Build/verification output
+verify-screenshot.*
+*.ppm
+build-manifest.txt
+
+# Local operator config (ports, resolution, VNC password)
+.env
+.env.local
+rootfs-overlay/etc/omarchy-container/env.local
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors
+*.swp
+*~
+.idea/
+.vscode/

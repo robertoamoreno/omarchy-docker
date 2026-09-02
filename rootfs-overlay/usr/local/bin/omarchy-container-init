@@ -1,0 +1,1256 @@
+#!/usr/bin/env bash
+#
+# EXPERIMENTAL container entrypoint. No systemd: no uwsm, no sddm, no logind
+# session, no system D-Bus. VNC has NO authentication unless OMARCHY_VNC_PASSWORD
+# is set. Not a supported way to run Omarchy.
+# =============================================================================
+# omarchy-container-init — PID 1 supervisor for omarchy:4.0.1
+# =============================================================================
+#
+# No systemd. No s6. No `sleep 5 && hope`. This process is PID 1: it owns the
+# runtime dir, starts the session bus, picks and starts a compositor, waits for
+# the compositor to actually report an output, starts wayvnc on that output,
+# optionally starts the noVNC bridge, then supervises the lot. If a critical
+# child dies, the container exits non-zero with the child's own log tail on
+# stderr. If a readiness gate times out, it says which one and why.
+#
+# -----------------------------------------------------------------------------
+# WHY NOT uwsm
+# -----------------------------------------------------------------------------
+# Omarchy's own boot path is `uwsm start hyprland`, and packages.conf NOTE 2
+# still says the entrypoint should call it. It CANNOT work here. uwsm is a
+# systemd-user-session wrapper: it shells out to `systemctl --user`,
+# `systemd-run --user`, and waits on wayland-session-pre@.target. This container
+# has no systemd, no user manager, no D-Bus system bus, and no /run/systemd. So
+# we launch the compositor binary directly and export by hand the environment
+# uwsm would otherwise have pushed into the user manager (see
+# /etc/omarchy-container/env). Everything downstream — Hyprland,
+# xdg-desktop-portal-hyprland, quickshell — reads that environment from its own
+# process, not from systemd, so direct launch is sufficient.
+#
+# -----------------------------------------------------------------------------
+# WHY THERE IS A COMPOSITOR SWITCH (read this before "simplifying" it away)
+# -----------------------------------------------------------------------------
+# PROBE 1 established, from aquamarine 0.14.0 source, that Hyprland 0.56.2
+# cannot start without a GBM-capable DRM node:
+#
+#   aquamarine src/backend/Headless.cpp:132-138
+#       CHeadlessBackend::drmFD()           -> -1   (unconditionally)
+#       CHeadlessBackend::drmRenderNodeFD() -> -1   (unconditionally)
+#   aquamarine src/backend/Backend.cpp:162-178
+#       primaryAllocator is built ONLY from an implementation with drmFD() >= 0;
+#       if none has one and implementations[0] is not AQ_BACKEND_NULL:
+#           "Cannot open backend: no allocator available" -> start() returns false
+#   Hyprland v0.56.2 src/Compositor.cpp:311-319
+#       requests HEADLESS(mandatory), DRM(if-available), WAYLAND(fallback).
+#       It never requests AQ_BACKEND_NULL, the one type that skips the check.
+#
+# There is no env var, config option or CLI flag that changes this. "Headless"
+# is not a GPU-free mode. On a host with /dev/dri (bare metal, a cloud VM,
+# `modprobe vkms`, Lima/Colima) Hyprland runs and this script runs it. On Docker
+# Desktop for macOS — kernel 6.10.14-linuxkit, no /dev/dri, CONFIG_DRM_VKMS /
+# VGEM / SIMPLEDRM / UDMABUF all unset, nothing to modprobe and nothing to pass
+# through — Hyprland aborts in CBackend::create() before it ever opens a Wayland
+# socket, and no amount of retrying will change that.
+#
+# PROBE 1 also proved that everything DOWNSTREAM of the compositor is fine on
+# that same host: a wlroots compositor with the pixman (CPU) renderer, driving
+# the SAME wayvnc 0.10.1 on a headless output, produced a real live framebuffer
+# over RFB (346 distinct colours, ticking clock). pixman needs no DRM node.
+#
+# So: OMARCHY_COMPOSITOR=auto (the default) probes for a usable DRM render node
+# and picks Hyprland when one exists, the wlroots fallback when one does not,
+# and says loudly which and why. `hyprland` and `sway` force the choice.
+# The VNC layer is identical in both cases — that is the whole point.
+#
+# -----------------------------------------------------------------------------
+# INTERFACE (frozen — must match build/build-image.sh and packages.conf)
+# -----------------------------------------------------------------------------
+#   user/uid/gid      omarchy / 1000 / 1000, passwordless sudo
+#   XDG_RUNTIME_DIR   /run/user/1000, mode 0700, owned by omarchy
+#   VNC               5900 (wayvnc, 0.0.0.0)
+#   noVNC             6080
+#   output            HEADLESS-1 at OMARCHY_RESOLUTION (default 1920x1080)
+#   tunables          see /etc/omarchy-container/env
+#
+# USAGE
+#   omarchy-container-init            # start the desktop and supervise it
+#   omarchy-container-init <cmd...>   # run <cmd> as omarchy instead (debugging:
+#                                     #   `docker run ... omarchy:4.0.1 bash`)
+# =============================================================================
+
+# Deliberately NOT `set -e`. A supervisor must decide for itself what a non-zero
+# status means; `set -e` turns a probe that legitimately returns 1 into a silent
+# death with no log line. Every fallible call below is checked explicitly.
+set -uo pipefail
+shopt -s nullglob
+
+readonly SELF="omarchy-init"
+readonly CONF_DIR="/etc/omarchy-container"
+readonly OMARCHY_USER="omarchy"
+readonly OMARCHY_UID=1000
+readonly OMARCHY_GID=1000
+readonly OMARCHY_HOME="/home/omarchy"
+readonly RUNTIME_DIR="/run/user/1000"
+readonly STATE_DIR="${RUNTIME_DIR}/omarchy-container"
+readonly LOG_DIR="${STATE_DIR}/log"
+
+# =============================================================================
+# logging
+# =============================================================================
+# printf's %(...)T is a bash builtin: no fork per log line.
+_msg() { printf '%(%H:%M:%S)T [%s] %s%s\n' -1 "$SELF" "$1" "$2" >&2; }
+log()  { _msg ''        "$*"; }
+warn() { _msg 'WARN: '  "$*"; }
+err()  { _msg 'ERROR: ' "$*"; }
+
+# die <message> [exit-code] — log, dump context, tear down children, exit.
+die() {
+  err "$1"
+  shutdown "${2:-1}"
+}
+
+# =============================================================================
+# service table
+# =============================================================================
+SVC_NAMES=()
+declare -A SVC_PID=()      # name -> pid, or -1 once reaped
+declare -A SVC_CRIT=()     # name -> 1 (its death kills the container) | 0
+declare -A SVC_LOG=()      # name -> log file
+SHUTTING_DOWN=0
+PRIV_PREFIX=()             # argv prefix that drops to uid 1000, or empty
+
+# _stream <tag> <logfile>
+# Runs inside a process substitution. Prefixes every line so `docker logs` is
+# readable, and keeps a copy on disk so a crash can be explained after the fact.
+# awk (gawk, pulled in by base) is line-buffered here via fflush().
+_stream() {
+  awk -v t="$1" '{ printf "[%s] %s\n", t, $0; fflush() }' | tee -a "$2"
+}
+
+# start_service <name> <critical:0|1> <argv...>
+# The argv MUST be a simple command (no shell function), so that the background
+# fork execs it directly and $! is the real pid — otherwise SIGTERM would be
+# delivered to a bash wrapper that does not forward it.
+start_service() {
+  local name="$1" crit="$2"
+  shift 2
+  local logfile="${LOG_DIR}/${name}.log"
+  : >"$logfile" 2>/dev/null || true
+  log "starting ${name}: $*"
+  "$@" > >(_stream "$name" "$logfile") 2>&1 &
+  local pid=$!
+  SVC_NAMES+=("$name")
+  SVC_PID["$name"]="$pid"
+  SVC_CRIT["$name"]="$crit"
+  SVC_LOG["$name"]="$logfile"
+  log "${name} running as pid ${pid} (critical=${crit})"
+}
+
+# dump_log <name> — last lines of a service log, for the post-mortem.
+dump_log() {
+  local name="$1" f="${SVC_LOG[$name]:-}"
+  [[ -n "$f" && -s "$f" ]] || { err "  (no output was captured from ${name})"; return; }
+  err "  ---- last 40 lines of ${f} ----"
+  tail -n 40 "$f" 2>/dev/null | while IFS= read -r line; do err "  | ${line}"; done
+  err "  ---- end ${name} log ----"
+}
+
+# service_died <name> <numeric-status>
+# The status must stay numeric all the way here: it becomes our own exit code,
+# and `exit` rejects anything else.
+service_died() {
+  local name="$1" status="$2" shown="$2"
+  SVC_PID["$name"]=-1
+  (( status > 128 && status < 192 )) && shown="${status} (killed by signal $(( status - 128 )))"
+  if [[ "${SVC_CRIT[$name]}" == "1" ]]; then
+    err "critical service '${name}' exited with status ${shown} — the container cannot continue"
+    dump_log "$name"
+    # Never exit 0 because a critical child exited 0: a compositor or a VNC
+    # server that returns cleanly on its own has still ended the session, and a
+    # 0 exit would tell an orchestrator this container did its job.
+    local code="$status"
+    (( code == 0 )) && code=1
+    shutdown "$code"
+  else
+    warn "auxiliary service '${name}' exited with status ${shown}; continuing without it"
+    dump_log "$name"
+  fi
+}
+
+# reap_children — reap anything that died, act on tracked services.
+# Also called from inside readiness polls so a service that dies during startup
+# is reported immediately instead of after a full timeout.
+reap_children() {
+  local name pid
+  for name in "${SVC_NAMES[@]}"; do
+    pid="${SVC_PID[$name]}"
+    (( pid > 0 )) || continue
+    kill -0 "$pid" 2>/dev/null && continue
+    local status=0
+    wait "$pid" 2>/dev/null || status=$?
+    service_died "$name" "$status"
+  done
+}
+
+# any_service_alive — false once every tracked service is gone. Guards the
+# supervise loop against spinning on a `wait -n` that has nothing left to wait
+# for (it returns 127 immediately when the shell has no children).
+any_service_alive() {
+  local name pid
+  for name in "${SVC_NAMES[@]}"; do
+    pid="${SVC_PID[$name]}"
+    (( pid > 0 )) && kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# shutdown <code> — forward SIGTERM to every child, escalate, exit.
+shutdown() {
+  local code="${1:-0}"
+  (( SHUTTING_DOWN )) && exit "$code"
+  SHUTTING_DOWN=1
+  trap '' TERM INT HUP
+  log "shutting down (exit ${code})"
+
+  local i name pid
+  for (( i=${#SVC_NAMES[@]}-1; i>=0; i-- )); do          # reverse start order
+    name="${SVC_NAMES[i]}"
+    pid="${SVC_PID[$name]}"
+    (( pid > 0 )) || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    log "  SIGTERM -> ${name} (pid ${pid})"
+    kill -TERM "$pid" 2>/dev/null
+  done
+
+  local deadline=$(( SECONDS + 10 )) alive
+  while (( SECONDS < deadline )); do
+    alive=0
+    for name in "${SVC_NAMES[@]}"; do
+      pid="${SVC_PID[$name]}"
+      (( pid > 0 )) && kill -0 "$pid" 2>/dev/null && alive=1
+    done
+    (( alive )) || break
+    sleep 0.25
+  done
+
+  for name in "${SVC_NAMES[@]}"; do
+    pid="${SVC_PID[$name]}"
+    (( pid > 0 )) || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "  ${name} (pid ${pid}) ignored SIGTERM; SIGKILL"
+      kill -KILL "$pid" 2>/dev/null
+    fi
+  done
+
+  exit "$code"
+}
+
+on_signal() {
+  local sig="$1"
+  log "received SIG${sig}"
+  shutdown 0
+}
+trap 'on_signal TERM' TERM
+trap 'on_signal INT'  INT
+trap 'on_signal HUP'  HUP
+
+# =============================================================================
+# readiness
+# =============================================================================
+# wait_for <timeout-s> <what> <argv...> — poll argv until it succeeds.
+# Returns 0 ready, 1 timed out. Never returns while a critical service is dead:
+# reap_children shuts the container down first, with that service's log.
+wait_for() { wait_for_service '' "$@"; }
+
+# wait_for_service <service|''> <timeout-s> <what> <argv...>
+# As wait_for, but gives up immediately if the named service has already died.
+# Without this, a crashed AUXILIARY service (dbus, seatd) still costs its whole
+# timeout: reap_children notices the death, logs it, declines to shut the
+# container down because the service is not critical — and then we keep polling
+# for a socket that nothing is going to create. Critical services never reach
+# that state, because their death shuts the container down inside reap_children.
+wait_for_service() {
+  local svc="$1" timeout="$2" what="$3"
+  shift 3
+  local deadline=$(( SECONDS + timeout ))
+  while :; do
+    "$@" >/dev/null 2>&1 && return 0
+    reap_children
+    if [[ -n "$svc" && "${SVC_PID[$svc]:-0}" == "-1" ]]; then
+      err "gave up waiting for ${what}: service '${svc}' is no longer running"
+      return 1
+    fi
+    (( SECONDS >= deadline )) && break
+    sleep 0.25
+  done
+  err "timed out after ${timeout}s waiting for: ${what}"
+  return 1
+}
+
+# =============================================================================
+# configuration
+# =============================================================================
+load_config() {
+  # shellcheck source=/dev/null
+  [[ -r "${CONF_DIR}/env" ]] || warn "${CONF_DIR}/env is missing; falling back to built-in defaults"
+  # shellcheck source=/dev/null
+  [[ -r "${CONF_DIR}/env" ]] && . "${CONF_DIR}/env"
+  # Optional operator override, e.g. `-v ./env.local:/etc/omarchy-container/env.local:ro`
+  # shellcheck source=/dev/null
+  [[ -r "${CONF_DIR}/env.local" ]] && . "${CONF_DIR}/env.local"
+  apply_defaults
+  return 0
+}
+
+# Every tunable gets its default HERE as well as in ${CONF_DIR}/env. The env
+# file is the documentation; this is the guarantee. Without it, a deleted or
+# bind-mount-shadowed env file turns `set -u` into a pile of unbound-variable
+# aborts with no explanation.
+apply_defaults() {
+  : "${OMARCHY_RESOLUTION:=1920x1080}"
+  : "${OMARCHY_VNC_PORT:=5900}"
+  : "${OMARCHY_VNC_ADDRESS:=0.0.0.0}"
+  : "${OMARCHY_VNC_PASSWORD:=}"
+  : "${OMARCHY_MAX_FPS:=30}"
+  : "${OMARCHY_SHELL:=1}"
+  : "${OMARCHY_PATH:=/usr/share/omarchy}"
+  export OMARCHY_PATH
+  : "${OMARCHY_VNC_USERNAME:=omarchy}"
+  : "${OMARCHY_NOVNC_PORT:=6080}"
+  : "${OMARCHY_NOVNC_ADDRESS:=0.0.0.0}"
+  : "${OMARCHY_ENABLE_NOVNC:=1}"
+  : "${OMARCHY_COMPOSITOR:=auto}"
+  : "${OMARCHY_STARTUP_TIMEOUT:=60}"
+  : "${OMARCHY_DEBUG:=0}"
+  export OMARCHY_RESOLUTION OMARCHY_VNC_PORT OMARCHY_VNC_ADDRESS \
+         OMARCHY_VNC_USERNAME OMARCHY_NOVNC_PORT OMARCHY_NOVNC_ADDRESS \
+         OMARCHY_ENABLE_NOVNC OMARCHY_COMPOSITOR OMARCHY_STARTUP_TIMEOUT \
+         OMARCHY_DEBUG
+  # Strip the VNC password out of the EXPORTED environment while keeping it as a
+  # shell variable we can still write into the wayvnc config. `export -n` does
+  # exactly that. Without it, a password passed with `docker run -e` is inherited
+  # by the compositor and therefore by every terminal, browser and script the
+  # user launches in the desktop, and shows up in plain `env` output.
+  # It remains visible in /proc/1/environ and in `docker inspect`; that is
+  # outside our control, and is why the config file is 0600 and why the honest
+  # recommendation in ${CONF_DIR}/env is to tunnel rather than to set a password.
+  export -n OMARCHY_VNC_PASSWORD 2>/dev/null || true
+  [[ "$OMARCHY_STARTUP_TIMEOUT" =~ ^[0-9]+$ ]] || die "OMARCHY_STARTUP_TIMEOUT='${OMARCHY_STARTUP_TIMEOUT}' is not a number"
+}
+
+is_true() {
+  case "${1,,}" in
+    1|true|yes|on|y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_resolution() {
+  local spec="${OMARCHY_RESOLUTION}"
+  if [[ "$spec" =~ ^([0-9]{2,5})[xX]([0-9]{2,5})(@([0-9]+)(Hz|hz)?)?$ ]]; then
+    RES_W="${BASH_REMATCH[1]}"
+    RES_H="${BASH_REMATCH[2]}"
+    RES_R="${BASH_REMATCH[4]:-60}"
+  else
+    die "OMARCHY_RESOLUTION='${spec}' is malformed. Expected WIDTHxHEIGHT[@REFRESH], e.g. 1920x1080 or 1600x900@30."
+  fi
+  # Odd widths break some SHM/RFB stride assumptions; round down to even.
+  (( RES_W % 2 )) && { RES_W=$(( RES_W - 1 )); warn "rounded width down to ${RES_W} (odd widths upset some VNC clients)"; }
+  (( RES_H % 2 )) && { RES_H=$(( RES_H - 1 )); warn "rounded height down to ${RES_H}"; }
+  readonly RES_W RES_H RES_R
+  log "resolution ${RES_W}x${RES_H}@${RES_R}"
+}
+
+check_port() {
+  local p="$1" what="$2"
+  [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )) || die "${what}='${p}' is not a valid TCP port"
+}
+
+# =============================================================================
+# privilege drop
+# =============================================================================
+AM_ROOT=0
+setup_privilege() {
+  [[ "$(id -u)" == "0" ]] && AM_ROOT=1
+  if (( ! AM_ROOT )); then
+    if [[ "$(id -u)" != "$OMARCHY_UID" ]]; then
+      warn "running as uid $(id -u), not root and not ${OMARCHY_UID}. Everything will run as this uid;"
+      warn "  XDG_RUNTIME_DIR ownership and the video/seat group memberships are yours to get right."
+    fi
+    PRIV_PREFIX=()
+    return 0
+  fi
+  id -u "$OMARCHY_USER" >/dev/null 2>&1 || die "user '${OMARCHY_USER}' does not exist in this image — the build did not create it"
+  if command -v setpriv >/dev/null 2>&1; then
+    # No --no-new-privs: it would break passwordless sudo in every terminal the
+    # compositor spawns, since those inherit the flag.
+    PRIV_PREFIX=(setpriv --reuid="$OMARCHY_UID" --regid="$OMARCHY_GID" --init-groups --)
+  elif command -v runuser >/dev/null 2>&1; then
+    PRIV_PREFIX=(runuser -u "$OMARCHY_USER" --)
+  else
+    die "neither setpriv nor runuser is available; cannot drop privileges (util-linux missing?)"
+  fi
+  log "privilege drop: ${PRIV_PREFIX[*]}"
+}
+
+# as_user <argv...> — foreground helper (hyprctl, swaymsg, tests).
+as_user() { "${PRIV_PREFIX[@]}" "$@"; }
+
+# =============================================================================
+# runtime dir
+# =============================================================================
+setup_runtime_dir() {
+  if (( AM_ROOT )); then
+    mkdir -p "$RUNTIME_DIR" || die "cannot create ${RUNTIME_DIR}"
+    chown "${OMARCHY_UID}:${OMARCHY_GID}" "$RUNTIME_DIR" || die "cannot chown ${RUNTIME_DIR}"
+    chmod 0700 "$RUNTIME_DIR" || die "cannot chmod 0700 ${RUNTIME_DIR}"
+    rm -rf "$STATE_DIR"
+    mkdir -p "$LOG_DIR" || die "cannot create ${LOG_DIR}"
+    chown -R "${OMARCHY_UID}:${OMARCHY_GID}" "$STATE_DIR"
+    if [[ ! -d "$OMARCHY_HOME" ]]; then
+      mkdir -p "$OMARCHY_HOME" && chown "${OMARCHY_UID}:${OMARCHY_GID}" "$OMARCHY_HOME"
+    fi
+    # A bind-mounted home (very common) can land with the wrong owner; the
+    # compositor then fails deep inside a config write with a confusing error.
+    local home_uid
+    home_uid="$(stat -c %u "$OMARCHY_HOME" 2>/dev/null || echo -1)"
+    [[ "$home_uid" == "$OMARCHY_UID" ]] || warn "${OMARCHY_HOME} is owned by uid ${home_uid}, not ${OMARCHY_UID}; if you bind-mounted it, chown it on the host"
+
+    # Rosetta lands a root-owned $HOME/.cache/rosetta the instant the first
+    # x86_64 binary runs -- and that is this script, as PID 1, as root, before
+    # any privilege drop. The user then cannot create anything else under
+    # .cache, and every shell in the desktop greets you with six copies of
+    #     Unable to create log dir "/home/omarchy/.cache/starship":
+    #     PermissionDenied
+    # Pre-create the standard XDG dirs owned by the user, then repair anything
+    # shallow that is still root-owned. Depth-limited so a large bind-mounted
+    # home costs nothing.
+    local d
+    for d in .cache .config .local .local/state .local/share; do
+      install -d -o "$OMARCHY_UID" -g "$OMARCHY_GID" -m 0755 "$OMARCHY_HOME/$d" 2>/dev/null || true
+    done
+    # quickshell keeps its instance dir and IPC socket here. If anything root
+    # touches this path first, quickshell (as the user) cannot create the
+    # instance and its IPC is silently unreachable.
+    install -d -o "$OMARCHY_UID" -g "$OMARCHY_GID" -m 0755 "$RUNTIME_DIR/quickshell" 2>/dev/null || true
+    find "$OMARCHY_HOME" -maxdepth 3 -uid 0 -exec chown "${OMARCHY_UID}:${OMARCHY_GID}" {} + 2>/dev/null || true
+  else
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    [[ -d "$RUNTIME_DIR" && -w "$RUNTIME_DIR" ]] || die "${RUNTIME_DIR} does not exist or is not writable by uid $(id -u). Run the container as root (the default) so the entrypoint can create it, or pre-create it with mode 0700."
+  fi
+  log "runtime dir ${RUNTIME_DIR} ready"
+}
+
+# =============================================================================
+# environment
+# =============================================================================
+export_common_env() {
+  export XDG_RUNTIME_DIR="$RUNTIME_DIR"
+  export HOME="$OMARCHY_HOME"
+  export USER="$OMARCHY_USER"
+  export LOGNAME="$OMARCHY_USER"
+  export SHELL="${SHELL:-/bin/bash}"
+  export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${OMARCHY_HOME}/.config}"
+  export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${OMARCHY_HOME}/.cache}"
+  export XDG_DATA_HOME="${XDG_DATA_HOME:-${OMARCHY_HOME}/.local/share}"
+  export XDG_STATE_HOME="${XDG_STATE_HOME:-${OMARCHY_HOME}/.local/state}"
+  export XDG_SESSION_TYPE=wayland
+  export XDG_SESSION_CLASS=user
+
+  # No GPU, ever. llvmpipe for GL, lavapipe for Vulkan (vulkan-swrast is in the
+  # package set precisely so Qt6/quickshell fall back instead of hard-failing).
+  export LIBGL_ALWAYS_SOFTWARE=1
+  export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+  export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-mesa}"
+
+  # No input devices are ever plugged in; VNC injects events over the protocol.
+  export WLR_LIBINPUT_NO_DEVICES=1
+
+  # Toolkit hints — these are the ones uwsm's env-hyprland would have exported.
+  export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland;xcb}"
+  export QT_WAYLAND_DISABLE_WINDOWDECORATION="${QT_WAYLAND_DISABLE_WINDOWDECORATION:-1}"
+  export QT_AUTO_SCREEN_SCALE_FACTOR="${QT_AUTO_SCREEN_SCALE_FACTOR:-1}"
+  export GDK_BACKEND="${GDK_BACKEND:-wayland,x11}"
+  export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland}"
+  export CLUTTER_BACKEND="${CLUTTER_BACKEND:-wayland}"
+  export MOZ_ENABLE_WAYLAND="${MOZ_ENABLE_WAYLAND:-1}"
+  export _JAVA_AWT_WM_NONREPARENTING=1
+  export XCURSOR_SIZE="${XCURSOR_SIZE:-24}"
+  export ELECTRON_OZONE_PLATFORM_HINT="${ELECTRON_OZONE_PLATFORM_HINT:-auto}"
+}
+
+export_hyprland_env() {
+  export XDG_CURRENT_DESKTOP=Hyprland
+  export XDG_SESSION_DESKTOP=Hyprland
+  # Accept a render-only node (renderD*) with no KMS/card* — this is what makes
+  # `--device /dev/dri` on a vkms or render-only host enough.
+  export AQ_NO_KMS_REQUIREMENT="${AQ_NO_KMS_REQUIREMENT:-1}"
+  # Hyprland's own systemd/dbus integration must be off: no user manager here.
+  export HYPRLAND_NO_SD_NOTIFY=1
+  export HYPRLAND_NO_SD_VARS=1
+  export HYPRLAND_NO_RT=1           # no CAP_SYS_NICE in a default container
+  export HYPRLAND_NO_CRASHREPORTER="${HYPRLAND_NO_CRASHREPORTER:-1}"
+  # Legacy aliases aquamarine still reads; harmless, and they help any wlroots
+  # helper (e.g. grim/slurp) that ends up in the same environment.
+  export WLR_BACKEND=headless
+  export WLR_BACKENDS=headless
+  export WLR_RENDERER_ALLOW_SOFTWARE=1
+}
+
+export_wlroots_env() {
+  export XDG_CURRENT_DESKTOP="${FALLBACK_DESKTOP}"
+  export XDG_SESSION_DESKTOP="${FALLBACK_DESKTOP}"
+  # PROBE 1 gotcha: wlroots reads WLR_BACKENDS (plural). With the singular form
+  # sway ignores it, tries DRM, and dies with "Timeout waiting session to
+  # become active". Set both; the plural one is the one that counts.
+  export WLR_BACKENDS=headless
+  export WLR_BACKEND=headless
+  # pixman is a CPU renderer: it needs no DRM node and no GBM allocator. This is
+  # exactly why the fallback works where aquamarine cannot.
+  export WLR_RENDERER="${WLR_RENDERER:-pixman}"
+  export WLR_RENDERER_ALLOW_SOFTWARE=1
+  export WLR_HEADLESS_OUTPUTS="${WLR_HEADLESS_OUTPUTS:-1}"
+}
+
+# =============================================================================
+# D-Bus session bus
+# =============================================================================
+start_dbus() {
+  if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    log "DBUS_SESSION_BUS_ADDRESS already set (${DBUS_SESSION_BUS_ADDRESS}); not starting a bus"
+    return 0
+  fi
+  if ! command -v dbus-daemon >/dev/null 2>&1; then
+    warn "dbus-daemon not found; portals, quickshell and gnome-keyring will not work"
+    return 0
+  fi
+  local sock="${RUNTIME_DIR}/bus"
+  rm -f "$sock"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=${sock}"
+  # --nofork so we keep the pid and can supervise it. The bus is auxiliary: if
+  # it dies the desktop degrades, it does not stop being a desktop.
+  start_service dbus 0 "${PRIV_PREFIX[@]}" dbus-daemon --session --nofork --nopidfile --address="unix:path=${sock}"
+  if ! wait_for_service dbus 10 "the session bus socket ${sock}" test -S "$sock"; then
+    warn "session bus never appeared; continuing without D-Bus"
+    return 0
+  fi
+  log "session bus at ${DBUS_SESSION_BUS_ADDRESS}"
+  # NOTE: no `dbus-update-activation-environment` — that pushes into a systemd
+  # user manager we do not have. Children inherit the environment directly.
+}
+
+# =============================================================================
+# seatd — only relevant on the Hyprland/DRM path
+# =============================================================================
+# PROBE 1: without a seat, aquamarine's DRM backend fails at "libseat: failed to
+# open a seat" and never even reaches GPU scanning. With `seatd -g seat` and the
+# user in group `seat` you get "Seat opened with backend 'seatd'". Required on
+# every host that has a real DRM node, including one with a real GPU.
+start_seatd() {
+  command -v seatd >/dev/null 2>&1 || { warn "seatd not installed; the DRM backend will fail to open a seat"; return 0; }
+  (( AM_ROOT )) || { warn "not root, cannot start seatd; if the DRM backend fails to open a seat, that is why"; return 0; }
+  if [[ -S /run/seatd.sock ]]; then
+    log "seatd socket already present"
+    export LIBSEAT_BACKEND=seatd
+    return 0
+  fi
+  if ! getent group seat >/dev/null 2>&1; then
+    warn "group 'seat' does not exist; the build should have run: groupadd -f seat && usermod -aG seat omarchy"
+  fi
+  # SEATD_VTBOUND=0 is REQUIRED in a container (measured 2026-08-30, RESEARCH.md
+  # section 12). Without it seatd logs "Created VT-bound seat seat0" and then
+  # every device open fails with
+  #     libseat: Couldn't open device at /dev/dri/card0
+  # which aquamarine reports misleadingly as "DRM_PRIME_CAP_IMPORT unsupported"
+  # / "Failed checking features", sending you off debugging the wrong layer.
+  # With it you get "Created seat seat0" and the DRM backend proceeds to
+  # atomic modesetting. There is no VT in a container to bind to.
+  export SEATD_VTBOUND=0
+  start_service seatd 0 env SEATD_VTBOUND=0 seatd -g seat
+  if wait_for_service seatd 10 "the seatd socket /run/seatd.sock" test -S /run/seatd.sock; then
+    export LIBSEAT_BACKEND=seatd
+    log "seatd ready"
+  else
+    warn "seatd did not create /run/seatd.sock; continuing (the compositor may fail to open a seat)"
+  fi
+}
+
+# =============================================================================
+# DRM probing and compositor selection
+# =============================================================================
+# A node is usable only if BOTH the device node and its sysfs entry exist.
+# PROBE 1: mknod'ing /dev/dri/card0 + renderD128 changes nothing, because
+# aquamarine enumerates GPUs through udev/sysfs (Session.cpp scanGPUs), not by
+# globbing /dev/dri. A node with no kernel driver behind it is invisible to it.
+DRM_NODE=""
+DRM_REASON="not probed"
+have_drm_node() {
+  DRM_REASON=""
+  local nodes=(/dev/dri/renderD* /dev/dri/card*)
+  local sysfs=(/sys/class/drm/card*)
+  (( ${#nodes[@]} )) || { DRM_REASON="/dev/dri is empty or absent (no --device /dev/dri?)"; return 1; }
+  (( ${#sysfs[@]} )) || { DRM_REASON="/sys/class/drm has no card* entries — the kernel has no DRM driver bound, so udev/sysfs enumeration finds nothing"; return 1; }
+  local n
+  for n in "${nodes[@]}"; do
+    [[ -c "$n" ]] || continue
+    # Test readability AS THE TARGET USER: root can always open it, omarchy
+    # needs to be in the owning group (docker run --group-add video).
+    if as_user /usr/bin/test -r "$n" -a -w "$n" 2>/dev/null; then
+      DRM_NODE="$n"
+      return 0
+    fi
+    DRM_REASON="${n} exists but is not readable/writable by uid ${OMARCHY_UID} — add 'docker run --group-add video' (or --group-add render)"
+  done
+  : "${DRM_REASON:=/dev/dri has entries but none are character devices}"
+  return 1
+}
+
+# A readable DRM node is necessary but NOT sufficient for Hyprland.
+#
+# Measured 2026-08-30 (docs/RESEARCH.md section 12): on a vkms-only host
+# /dev/dri/card0 exists, is readable, and aquamarine initialises it happily
+# (atomic modesetting, 1 CRTC, connector Virtual-1 connected) -- and then dies at
+#   "CDRMRenderer(drm): Can't create renderer, no matching devices found"
+# because aquamarine matches EGL devices on EGL_DRM_DEVICE_FILE_EXT and mesa
+# enumerates only a software device there. Hyprland then serves a Wayland socket
+# and paints NOTHING: VNC connects to a black screen. That is the worst possible
+# outcome to hand a user, so probe for the real capability, not the device file.
+EGL_REASON=""
+hyprland_can_render() {
+  local probe=/usr/local/bin/omarchy-egl-probe
+  if [[ ! -x "$probe" ]]; then
+    # Probe missing (older image): fall back to the weaker device-node test
+    # rather than refusing to start Hyprland at all.
+    EGL_REASON="omarchy-egl-probe is not installed; falling back to the DRM-node test alone"
+    warn "$EGL_REASON"
+    return 0
+  fi
+  if as_user "$probe" >/dev/null 2>&1; then
+    return 0
+  fi
+  EGL_REASON="mesa enumerates no EGL device with a DRM device file, so aquamarine cannot build a renderer (run 'omarchy-egl-probe -v' to see the enumeration)"
+  return 1
+}
+
+OMARCHY_SHELL_READY=0
+COMPOSITOR=""
+COMPOSITOR_BIN=""
+FALLBACK_DESKTOP="sway"
+select_fallback_compositor() {
+  # PROBE 1 proved sway 1.12 + WLR_RENDERER=pixman end-to-end with this exact
+  # wayvnc. labwc and cage are the same wlroots/pixman story if sway is not in
+  # the image; try them in descending order of "is a usable desktop".
+  local c
+  for c in sway labwc cage; do
+    if command -v "$c" >/dev/null 2>&1; then
+      COMPOSITOR=wlroots
+      COMPOSITOR_BIN="$c"
+      FALLBACK_DESKTOP="$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+no_fallback_installed() {
+  err "No usable compositor is available in this image."
+  err ""
+  err "  Hyprland cannot start here: ${DRM_REASON}"
+  err "  Hyprland 0.56.2 / aquamarine 0.14.0 REQUIRE a GBM-capable DRM node."
+  err "  The headless backend returns drmFD() == -1 unconditionally"
+  err "  (aquamarine Headless.cpp:132) and Backend.cpp:162-178 builds the GBM"
+  err "  allocator only from an implementation with drmFD() >= 0, so a headless-"
+  err "  only start always ends in 'Cannot open backend: no allocator available'."
+  err "  Headless is not a GPU-free mode and no env var changes that."
+  err ""
+  err "  Fix it one of two ways:"
+  err "    1. Run this image on a host that HAS a DRM node — any x86_64 Linux"
+  err "       box, a cloud VM, GitHub Actions ubuntu-latest, or Lima/Colima."
+  err "       Then:  modprobe vkms   (if there is no real GPU)"
+  err "              docker run --device /dev/dri --group-add video ..."
+  err "       This entrypoint will detect the node and run real Hyprland."
+  err "    2. Ship a wlroots fallback compositor in the image and it will be"
+  err "       used automatically on DRM-less hosts. Add to packages.conf, from"
+  err "       the pinned ALA snapshot:   sway  swaybg"
+  err "       (PROBE 1 verified sway 1.12 + WLR_RENDERER=pixman + this exact"
+  err "       wayvnc 0.10.1 produces a real framebuffer on this very host.)"
+  err ""
+  die "no compositor to start"
+}
+
+select_compositor() {
+  local want="${OMARCHY_COMPOSITOR,,}"
+  case "$want" in
+    hyprland)
+      command -v Hyprland >/dev/null 2>&1 || die "OMARCHY_COMPOSITOR=hyprland but /usr/bin/Hyprland is not installed (note the capital H — there is no lowercase 'hyprland' binary)"
+      COMPOSITOR=hyprland
+      COMPOSITOR_BIN=Hyprland
+      if ! have_drm_node || ! hyprland_can_render; then
+        warn "OMARCHY_COMPOSITOR=hyprland was forced, but this host cannot render it:"
+        warn "  ${EGL_REASON:-${DRM_REASON}}"
+        warn "Hyprland will almost certainly abort with 'Cannot open backend: no allocator"
+        warn "available'. Starting it anyway because you asked."
+      fi
+      ;;
+    sway|labwc|cage|wlroots|fallback)
+      if [[ "$want" != "wlroots" && "$want" != "fallback" ]]; then
+        command -v "$want" >/dev/null 2>&1 || die "OMARCHY_COMPOSITOR=${want} but ${want} is not installed in this image"
+        COMPOSITOR=wlroots
+        COMPOSITOR_BIN="$want"
+        FALLBACK_DESKTOP="$want"
+      else
+        select_fallback_compositor || no_fallback_installed
+      fi
+      ;;
+    auto|'')
+      if have_drm_node && hyprland_can_render && command -v Hyprland >/dev/null 2>&1; then
+        COMPOSITOR=hyprland
+        COMPOSITOR_BIN=Hyprland
+        log "DRM node ${DRM_NODE} is usable AND mesa exposes a DRM-backed EGL device"
+        log " -> running real Hyprland (the Omarchy compositor)"
+      else
+        if command -v Hyprland >/dev/null 2>&1; then
+          warn "======================================================================"
+          warn "Hyprland is installed but cannot RENDER on this host."
+          warn "  reason: ${EGL_REASON:-${DRM_REASON}}"
+          warn "  Hyprland 0.56.2 uses aquamarine 0.14.0, whose headless backend"
+          warn "  returns drmFD() == -1 unconditionally (Headless.cpp:132), while"
+          warn "  Backend.cpp:162-178 creates the GBM allocator ONLY from a backend"
+          warn "  with drmFD() >= 0. Hyprland never requests AQ_BACKEND_NULL, the one"
+          warn "  backend type that bypasses that check (Compositor.cpp:311-319)."
+          warn "  Result, every time: 'Cannot open backend: no allocator available'."
+          warn "  Give the container a DRM node (modprobe vkms on the host, then"
+          warn "  docker run --device /dev/dri --group-add video) and this entrypoint"
+          warn "  will start Hyprland instead, with no other changes."
+          warn "  Falling back to a wlroots + pixman compositor over the same wayvnc."
+          warn "======================================================================"
+        fi
+        select_fallback_compositor || no_fallback_installed
+      fi
+      ;;
+    *)
+      die "OMARCHY_COMPOSITOR='${OMARCHY_COMPOSITOR}' is not one of: auto, hyprland, sway, labwc, cage"
+      ;;
+  esac
+  log "compositor: ${COMPOSITOR_BIN} (mode=${COMPOSITOR})"
+}
+
+# PROBE 1: Arch's /usr/bin/sway ships file capability cap_sys_nice=ep, which is
+# outside Docker's default bounding set, so exec dies with a bare "Operation not
+# permitted" and no explanation. The build should strip it; do it here too so a
+# stale image still boots.
+strip_file_caps() {
+  local bin path
+  bin="$(command -v "$COMPOSITOR_BIN" 2>/dev/null)" || return 0
+  path="$bin"
+  command -v getcap >/dev/null 2>&1 || return 0
+  local caps
+  caps="$(getcap "$path" 2>/dev/null)"
+  [[ -n "$caps" ]] || return 0
+  warn "${path} carries file capabilities (${caps}); Docker's default bounding set does not include them and exec would fail with a bare 'Operation not permitted'"
+  if (( AM_ROOT )) && command -v setcap >/dev/null 2>&1; then
+    setcap -r "$path" 2>/dev/null && log "stripped file capabilities from ${path}"
+  fi
+}
+
+# =============================================================================
+# generated configuration
+# =============================================================================
+# The shipped configs in /etc/omarchy-container are static and hand-editable.
+# The resolution and the VNC port are runtime values, so we generate a thin
+# wrapper in the runtime dir that pulls the static file in and then overrides
+# the couple of lines that must change. Nothing in /etc is ever rewritten.
+generate_configs() {
+  local user_conf
+
+  # ---- Hyprland ----
+  GEN_HYPR="${STATE_DIR}/hyprland.conf"
+  cat >"$GEN_HYPR" <<EOF
+# Generated by omarchy-container-init. Edits here are lost on restart;
+# edit ${CONF_DIR}/hyprland.conf instead.
+source = ${CONF_DIR}/hyprland.conf
+monitor = HEADLESS-1, ${RES_W}x${RES_H}@${RES_R}, 0x0, 1
+EOF
+  user_conf="${OMARCHY_HOME}/.config/omarchy-container/hyprland.conf"
+  [[ -r "$user_conf" ]] && printf 'source = %s\n' "$user_conf" >>"$GEN_HYPR"
+
+  # ---- wlroots fallback (sway syntax) ----
+  GEN_SWAY="${STATE_DIR}/sway.conf"
+  cat >"$GEN_SWAY" <<EOF
+# Generated by omarchy-container-init. Edit ${CONF_DIR}/sway.conf instead.
+include ${CONF_DIR}/sway.conf
+output HEADLESS-1 mode --custom ${RES_W}x${RES_H}@${RES_R}Hz
+output HEADLESS-1 position 0 0
+EOF
+  user_conf="${OMARCHY_HOME}/.config/omarchy-container/sway.conf"
+  [[ -r "$user_conf" ]] && printf 'include %s\n' "$user_conf" >>"$GEN_SWAY"
+
+  # ---- wayvnc ----
+  # Strip the keys we own from the template, then append the live values, so
+  # there is exactly one definition of each and no ambiguity about precedence.
+  GEN_WAYVNC="${STATE_DIR}/wayvnc.conf"
+  if [[ -r "${CONF_DIR}/wayvnc.conf" ]]; then
+    grep -vE '^[[:space:]]*(address|port|enable_auth|username|password)[[:space:]]*=' \
+      "${CONF_DIR}/wayvnc.conf" >"$GEN_WAYVNC"
+  else
+    warn "${CONF_DIR}/wayvnc.conf is missing; generating a minimal one"
+    : >"$GEN_WAYVNC"
+  fi
+  VNC_RSA_KEY="${STATE_DIR}/wayvnc-rsa.pem"
+  if [[ -n "${OMARCHY_VNC_PASSWORD}" && ! -s "$VNC_RSA_KEY" ]]; then
+    if command -v openssl >/dev/null 2>&1; then
+      if openssl genrsa -out "$VNC_RSA_KEY" 2048 >/dev/null 2>&1; then
+        chmod 0600 "$VNC_RSA_KEY"
+        log "generated ${VNC_RSA_KEY} for wayvnc password auth"
+      else
+        die "OMARCHY_VNC_PASSWORD is set but the RSA key could not be generated at ${VNC_RSA_KEY}. wayvnc cannot do password auth without key material. Unset OMARCHY_VNC_PASSWORD to run without authentication."
+      fi
+    else
+      die "OMARCHY_VNC_PASSWORD is set but openssl is not installed, so no RSA key can be generated. wayvnc requires key material for password auth. Unset OMARCHY_VNC_PASSWORD to run without authentication."
+    fi
+  fi
+  {
+    printf '\n# --- generated by omarchy-container-init ---\n'
+    printf 'address=%s\n' "${OMARCHY_VNC_ADDRESS}"
+    printf 'port=%s\n'    "${OMARCHY_VNC_PORT}"
+    if [[ -n "${OMARCHY_VNC_PASSWORD}" ]]; then
+      # wayvnc's authenticated security types REQUIRE key material. Emitting
+      # enable_auth=true on its own makes wayvnc refuse to start, and since
+      # wayvnc is a critical service that takes the whole container down --
+      # i.e. the one documented way to secure port 5900 would brick the image.
+      # Generate an RSA key on first use. noVNC 1.5 speaks RSA-AES, so browser
+      # access keeps working too.
+      printf 'enable_auth=true\n'
+      printf 'username=%s\n' "${OMARCHY_VNC_USERNAME}"
+      printf 'password=%s\n' "${OMARCHY_VNC_PASSWORD}"
+      printf 'rsa_private_key_file=%s\n' "${VNC_RSA_KEY}"
+    else
+      printf 'enable_auth=false\n'
+    fi
+  } >>"$GEN_WAYVNC"
+  chmod 0600 "$GEN_WAYVNC"
+
+  if (( AM_ROOT )); then
+    chown -R "${OMARCHY_UID}:${OMARCHY_GID}" "$STATE_DIR"
+  fi
+  log "generated ${GEN_HYPR}, ${GEN_SWAY}, ${GEN_WAYVNC}"
+}
+
+# =============================================================================
+# compositor startup + readiness
+# =============================================================================
+# clean_stale_session — remove session sockets left behind by a previous run.
+#
+# Only ever called on the desktop path, never on the `init <cmd>` passthrough
+# path: there, a live session may be running and these sockets are in use.
+#
+# Without this, a restart of the entrypoint inside a container whose
+# /run/user/1000 survived (a bind-mounted runtime dir, a supervisor restart, a
+# compositor that crashed and left its socket) makes the readiness gates lie —
+# find_wayland_socket happily returns a DEAD socket, and wayvnc is then pointed
+# at a compositor that no longer exists. Verified during development: a stale
+# wayland-1 satisfied the gate and the failure surfaced two gates later as a
+# confusing "no IPC socket" error.
+clean_stale_session() {
+  local removed=()
+  local f
+  for f in "${RUNTIME_DIR}"/wayland-* "${RUNTIME_DIR}"/sway-ipc.*.sock "${RUNTIME_DIR}"/sway-ipc.sock; do
+    [[ -e "$f" ]] || continue
+    rm -f "$f" 2>/dev/null && removed+=("${f##*/}")
+  done
+  if [[ -d "${RUNTIME_DIR}/hypr" ]]; then
+    for f in "${RUNTIME_DIR}"/hypr/*; do
+      [[ -e "$f" ]] || continue
+      rm -rf "$f" 2>/dev/null && removed+=("hypr/${f##*/}")
+    done
+  fi
+  (( ${#removed[@]} )) && warn "removed stale session state from a previous run: ${removed[*]}"
+  return 0
+}
+
+find_wayland_socket() {
+  local s
+  for s in "${RUNTIME_DIR}"/wayland-*; do
+    [[ "$s" == *.lock ]] && continue
+    [[ -S "$s" ]] || continue
+    WAYLAND_DISPLAY="${s##*/}"
+    export WAYLAND_DISPLAY
+    return 0
+  done
+  return 1
+}
+
+find_hypr_signature() {
+  local d newest=""
+  for d in "${RUNTIME_DIR}"/hypr/*/; do
+    [[ -S "${d}.socket.sock" ]] || continue
+    if [[ -z "$newest" || "$d" -nt "$newest" ]]; then newest="$d"; fi
+  done
+  [[ -n "$newest" ]] || return 1
+  newest="${newest%/}"
+  HYPRLAND_INSTANCE_SIGNATURE="${newest##*/}"
+  export HYPRLAND_INSTANCE_SIGNATURE
+  return 0
+}
+
+start_compositor() {
+  local autostart="${CONF_DIR}/autostart.sh"
+  [[ -x "$autostart" ]] || warn "${autostart} is not executable; the desktop will come up empty"
+
+  if [[ "$COMPOSITOR" == "hyprland" ]]; then
+    export_hyprland_env
+    start_service compositor 1 "${PRIV_PREFIX[@]}" Hyprland -c "$GEN_HYPR"
+  else
+    export_wlroots_env
+    export SWAYSOCK="${RUNTIME_DIR}/sway-ipc.sock"
+    rm -f "$SWAYSOCK"
+    case "$COMPOSITOR_BIN" in
+      sway)
+        start_service compositor 1 "${PRIV_PREFIX[@]}" sway -c "$GEN_SWAY"
+        ;;
+      labwc)
+        # labwc stays up after its startup script returns, so the shared
+        # autostart hook works unchanged. No config file is shipped for it: it
+        # is a third-tier fallback and runs on its defaults.
+        start_service compositor 1 "${PRIV_PREFIX[@]}" labwc -s "$autostart"
+        ;;
+      cage)
+        # cage is a KIOSK: it exits as soon as the process it was given exits.
+        # Handing it autostart.sh would end the session instantly, because that
+        # script backgrounds its work and returns. Give it the terminal itself,
+        # in the foreground, so the session lives exactly as long as the app.
+        # This also means the autostart hooks do NOT run under cage.
+        warn "cage is a single-application kiosk compositor: no autostart hooks, no window management, just one terminal"
+        start_service compositor 1 "${PRIV_PREFIX[@]}" cage -- "${OMARCHY_TERMINAL:-foot}" /usr/local/bin/omarchy-container-welcome
+        ;;
+    esac
+  fi
+
+  wait_for "$OMARCHY_STARTUP_TIMEOUT" "the compositor's Wayland socket in ${RUNTIME_DIR}" find_wayland_socket \
+    || die "compositor '${COMPOSITOR_BIN}' never created a Wayland socket. Its log is above; the usual causes are (a) no DRM node for aquamarine, (b) XDG_RUNTIME_DIR wrong or not 0700, (c) a fatal config error."
+  log "Wayland socket: WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+
+  if [[ "$COMPOSITOR" == "hyprland" ]]; then
+    wait_for 15 "Hyprland's IPC instance directory" find_hypr_signature \
+      || die "Hyprland created a Wayland socket but never an IPC socket under ${RUNTIME_DIR}/hypr — hyprctl cannot be used, so the output cannot be verified"
+    log "HYPRLAND_INSTANCE_SIGNATURE=${HYPRLAND_INSTANCE_SIGNATURE}"
+  else
+    wait_for 15 "the sway IPC socket ${SWAYSOCK}" test -S "$SWAYSOCK" || {
+      # sway only honours SWAYSOCK if the path does not already exist; if that
+      # failed for any reason it will have generated its own name.
+      local s
+      for s in "${RUNTIME_DIR}"/sway-ipc.*.sock; do
+        [[ -S "$s" ]] && { export SWAYSOCK="$s"; break; }
+      done
+      [[ -S "${SWAYSOCK}" ]] || die "no sway IPC socket appeared; cannot query outputs"
+      log "using discovered SWAYSOCK=${SWAYSOCK}"
+    }
+  fi
+}
+
+# list_outputs — one output name per line on stdout.
+list_outputs() {
+  local json=""
+  if [[ "$COMPOSITOR" == "hyprland" ]]; then
+    json="$(as_user hyprctl monitors -j 2>/dev/null)"
+  else
+    json="$(as_user swaymsg -t get_outputs -r 2>/dev/null)"
+  fi
+  [[ -n "$json" && "$json" != "[]" ]] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -r '.[].name' 2>/dev/null
+  else
+    printf '%s' "$json" \
+      | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/'
+  fi
+}
+
+have_output() { [[ -n "$(list_outputs 2>/dev/null | head -n1)" ]]; }
+
+# Pick the output wayvnc will capture. HEADLESS-1 is the frozen interface; take
+# it if it is there, otherwise the first one, and say so.
+OUTPUT_NAME=""
+resolve_output() {
+  if ! wait_for "$OMARCHY_STARTUP_TIMEOUT" "the compositor to report at least one output" have_output; then
+    if [[ "$COMPOSITOR" == "hyprland" ]]; then
+      # RESEARCH.md §7 fallback ladder, step 1: ask Hyprland for a headless
+      # output explicitly. prepareFallbackOutput() may have produced only an
+      # internal fallback that is not usable for capture.
+      warn "no output reported; asking Hyprland to create one (hyprctl output create headless)"
+      as_user hyprctl output create headless >/dev/null 2>&1
+      wait_for 15 "an output after 'hyprctl output create headless'" have_output \
+        || die "the compositor is running but reports no outputs, and creating one explicitly did not help. wayvnc has nothing to capture."
+    else
+      die "the compositor is running but reports no outputs. For wlroots this means WLR_HEADLESS_OUTPUTS did not take effect (it is currently '${WLR_HEADLESS_OUTPUTS:-unset}')."
+    fi
+  fi
+
+  local outputs name
+  mapfile -t outputs < <(list_outputs)
+  for name in "${outputs[@]}"; do
+    if [[ "$name" == "HEADLESS-1" ]]; then OUTPUT_NAME="HEADLESS-1"; break; fi
+  done
+  if [[ -z "$OUTPUT_NAME" ]]; then
+    OUTPUT_NAME="${outputs[0]}"
+    warn "HEADLESS-1 is not among the compositor's outputs (${outputs[*]}); capturing '${OUTPUT_NAME}' instead"
+  fi
+  log "capture output: ${OUTPUT_NAME} (all outputs: ${outputs[*]})"
+
+  # Re-apply the requested mode by IPC. The config already asks for it, but if
+  # the output came from `hyprctl output create headless` or arrived with a
+  # different name, the config's monitor rule never matched it.
+  if [[ "$COMPOSITOR" == "hyprland" ]]; then
+    as_user hyprctl keyword monitor "${OUTPUT_NAME},${RES_W}x${RES_H}@${RES_R},0x0,1" >/dev/null 2>&1 \
+      || warn "could not apply the monitor mode via hyprctl; the output keeps whatever mode it came up with"
+  else
+    as_user swaymsg output "${OUTPUT_NAME}" mode --custom "${RES_W}x${RES_H}@${RES_R}Hz" >/dev/null 2>&1 \
+      || warn "could not apply the output mode via swaymsg; the output keeps whatever mode it came up with"
+  fi
+}
+
+# =============================================================================
+# wayvnc
+# =============================================================================
+port_is_listening() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .
+  else
+    # No iproute2: fall back to /proc/net/tcp, port in hex, big-endian.
+    local hex
+    hex="$(printf '%04X' "$p")"
+    grep -qiE "^[[:space:]]*[0-9]+:[[:space:]]+[0-9A-F]{8}:${hex} " /proc/net/tcp /proc/net/tcp6 2>/dev/null
+  fi
+}
+
+start_wayvnc() {
+  command -v wayvnc >/dev/null 2>&1 \
+    || die "wayvnc is not installed. It is NOT in the ISO's [offline] mirror (RESEARCH §6, reconfirmed by PROBE 2); the build must install it from the pinned ALA snapshot."
+  local loglevel=info
+  is_true "$OMARCHY_DEBUG" && loglevel=debug
+  # -f/--max-fps is a FLAG, not a config key: putting max_fps in the config file
+  # makes wayvnc reject the entire config ("Failed to load config. Error on
+  # line N") and, being critical, take the container down with it.
+  start_service wayvnc 1 "${PRIV_PREFIX[@]}" \
+    wayvnc -C "$GEN_WAYVNC" -o "$OUTPUT_NAME" -L "$loglevel" \
+    -f "$OMARCHY_MAX_FPS" \
+    "$OMARCHY_VNC_ADDRESS" "$OMARCHY_VNC_PORT"
+  wait_for 30 "wayvnc to listen on ${OMARCHY_VNC_ADDRESS}:${OMARCHY_VNC_PORT}" port_is_listening "$OMARCHY_VNC_PORT" \
+    || die "wayvnc started but never listened on port ${OMARCHY_VNC_PORT}. If the log above mentions authentication, note that wayvnc requires a TLS or RSA key for password auth; unset OMARCHY_VNC_PASSWORD to run without it."
+  log "wayvnc listening on ${OMARCHY_VNC_ADDRESS}:${OMARCHY_VNC_PORT}, capturing ${OUTPUT_NAME}"
+}
+
+# =============================================================================
+# noVNC / websockify
+# =============================================================================
+# Neither `novnc` nor `python-websockify` exists in [offline] or in the pinned
+# ALA snapshot, so build-image.sh vendors them (packages.conf:
+# OMARCHY_NOVNC_VENDOR=1) into /usr/share/novnc and /usr/share/websockify.
+# If the build skipped that, this is a warning, not a fatal error: VNC on 5900
+# still works and killing the container over a missing browser client would be
+# a worse outcome than losing the browser client.
+start_novnc() {
+  is_true "$OMARCHY_ENABLE_NOVNC" || { log "noVNC disabled (OMARCHY_ENABLE_NOVNC=${OMARCHY_ENABLE_NOVNC})"; return 0; }
+
+  local webroot=""
+  local d
+  for d in /usr/share/novnc /opt/novnc /usr/share/webapps/novnc; do
+    [[ -f "${d}/vnc.html" ]] && { webroot="$d"; break; }
+  done
+  if [[ -z "$webroot" ]]; then
+    warn "OMARCHY_ENABLE_NOVNC=1 but no noVNC web root was found (looked for vnc.html in /usr/share/novnc, /opt/novnc, /usr/share/webapps/novnc)."
+    warn "  The build must vendor noVNC (packages.conf OMARCHY_NOVNC_VENDOR=1). VNC on ${OMARCHY_VNC_PORT} is unaffected."
+    return 0
+  fi
+
+  local -a cmd=()
+  if command -v websockify >/dev/null 2>&1; then
+    cmd=(websockify --web "$webroot" "${OMARCHY_NOVNC_ADDRESS}:${OMARCHY_NOVNC_PORT}" "127.0.0.1:${OMARCHY_VNC_PORT}")
+  elif [[ -x /usr/share/websockify/run ]]; then
+    cmd=(/usr/share/websockify/run --web "$webroot" "${OMARCHY_NOVNC_ADDRESS}:${OMARCHY_NOVNC_PORT}" "127.0.0.1:${OMARCHY_VNC_PORT}")
+  elif [[ -d /usr/share/websockify/websockify ]] && command -v python3 >/dev/null 2>&1; then
+    export PYTHONPATH="/usr/share/websockify${PYTHONPATH:+:${PYTHONPATH}}"
+    cmd=(python3 -m websockify --web "$webroot" "${OMARCHY_NOVNC_ADDRESS}:${OMARCHY_NOVNC_PORT}" "127.0.0.1:${OMARCHY_VNC_PORT}")
+  elif [[ -x "${webroot}/utils/novnc_proxy" ]]; then
+    cmd=("${webroot}/utils/novnc_proxy" --vnc "127.0.0.1:${OMARCHY_VNC_PORT}" --listen "${OMARCHY_NOVNC_PORT}" --web "$webroot")
+  else
+    warn "noVNC web root found at ${webroot} but no websockify to serve it; skipping the browser client."
+    return 0
+  fi
+
+  # NOT critical: /etc/omarchy-container/env promises we "log a warning and
+  # carry on with VNC only -- it will not kill the container over a missing
+  # browser client". Registering this as critical contradicted that and let a
+  # websockify crash, or a busy 6080, tear down a working desktop.
+  start_service novnc 0 "${PRIV_PREFIX[@]}" "${cmd[@]}"
+  if ! wait_for 30 "websockify to listen on ${OMARCHY_NOVNC_ADDRESS}:${OMARCHY_NOVNC_PORT}" port_is_listening "$OMARCHY_NOVNC_PORT"; then
+    warn "the noVNC bridge never listened on ${OMARCHY_NOVNC_PORT}; continuing with VNC only on ${OMARCHY_VNC_PORT}"
+    return 0
+  fi
+  NOVNC_READY=1
+  log "noVNC serving ${webroot} on ${OMARCHY_NOVNC_ADDRESS}:${OMARCHY_NOVNC_PORT}"
+}
+
+# =============================================================================
+# Omarchy shell (quickshell)
+# =============================================================================
+# Omarchy's desktop shell -- the bar, menu, panels -- is quickshell running
+# $OMARCHY_PATH/shell. Without it `omarchy plugin list`, `omarchy menu` and
+# everything else routed through omarchy-shell IPC answer
+#     omarchy-shell is not running
+# and you get a bare compositor with none of Omarchy's UI.
+#
+# We deliberately do NOT use /usr/bin/omarchy-launch-shell. It wraps quickshell
+# in `systemd-cat` (no journal here) and its supervisor probes the compositor
+# with `hyprctl -j monitors`, which cannot see sway and would make it give up.
+# Launching quickshell directly is what that script does underneath.
+#
+# Verified working under sway: "Configuration Loaded", bar renders, plugin list
+# responds. Degradations, all non-fatal and all logged by quickshell itself:
+#   * $HYPRLAND_INSTANCE_SIGNATURE unset -> workspace/window widgets are inert
+#   * no system D-Bus -> UPower, BlueZ and NetworkManager widgets unavailable
+#   * no pipewire daemon -> audio widget inert
+#   * no logind session -> polkit agent cannot register
+start_omarchy_shell() {
+  [[ "$OMARCHY_SHELL" == "0" ]] && { log "Omarchy shell disabled (OMARCHY_SHELL=0)"; return 0; }
+  if ! command -v quickshell >/dev/null 2>&1; then
+    warn "quickshell is not installed; skipping the Omarchy shell"
+    return 0
+  fi
+  local shelldir="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+  if [[ ! -f "$shelldir/shell.qml" ]]; then
+    warn "no shell.qml under ${shelldir}; skipping the Omarchy shell"
+    return 0
+  fi
+
+  # Non-critical: a desktop with no bar still beats no desktop at all.
+  start_service omarchy-shell 0 "${PRIV_PREFIX[@]}" \
+    env OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}" \
+        QS_DISABLE_FILE_WATCHER=1 QS_NO_RELOAD_POPUP=1 \
+        quickshell -n -p "$shelldir"
+
+  # MUST run as the desktop user, and MUST NOT use -q.
+  #  * as root, omarchy-shell creates $XDG_RUNTIME_DIR/quickshell as root:root.
+  #    Under emulation quickshell needs several seconds to boot, so a root ping
+  #    wins the race, and quickshell can then never create its instance dir --
+  #    no IPC socket, and `omarchy plugin list` says "omarchy-shell is not
+  #    running" even though the process is alive. Self-inflicted deadlock.
+  #  * -q is documented as "return success even when the shell ... is
+  #    unavailable", so a -q ping can never fail and gates nothing.
+  if wait_for 30 "the Omarchy shell to answer IPC" \
+       as_user sh -c "XDG_RUNTIME_DIR=${RUNTIME_DIR} omarchy-shell shell ping >/dev/null 2>&1"; then
+    OMARCHY_SHELL_READY=1
+    log "Omarchy shell up (quickshell); omarchy plugin/menu commands will work"
+    # Two bars otherwise: quickshell draws Omarchy's, and sway.conf draws its
+    # own fallback swaybar. Hide the fallback now that the real one is up.
+    if [[ "$COMPOSITOR" == "wlroots" ]] && command -v swaymsg >/dev/null 2>&1; then
+      as_user sh -c "XDG_RUNTIME_DIR=$RUNTIME_DIR SWAYSOCK=\$(ls $RUNTIME_DIR/sway-ipc.* 2>/dev/null | head -1) swaymsg bar bar-0 mode invisible" >/dev/null 2>&1 \
+        && log "hid the fallback swaybar in favour of Omarchy's" || true
+    fi
+  else
+    warn "the Omarchy shell did not answer IPC in 30s; continuing without it"
+    warn "  'omarchy plugin list' will report: omarchy-shell is not running"
+  fi
+}
+
+# =============================================================================
+# banner
+# =============================================================================
+banner() {
+  local auth="disabled (anyone who can reach the port gets the desktop)"
+  [[ -n "$OMARCHY_VNC_PASSWORD" ]] && auth="enabled, username '${OMARCHY_VNC_USERNAME}'"
+  log "======================================================================"
+  log "  Omarchy container is up"
+  log "    compositor : ${COMPOSITOR_BIN}$( [[ "$COMPOSITOR" == "wlroots" ]] && printf ' (fallback: no DRM node for Hyprland)' )"
+  log "    output     : ${OUTPUT_NAME} @ ${RES_W}x${RES_H}@${RES_R}"
+  log "    VNC        : vnc://<host>:${OMARCHY_VNC_PORT}   auth ${auth}"
+  (( NOVNC_READY )) && \
+  log "    browser    : http://<host>:${OMARCHY_NOVNC_PORT}/vnc.html?autoconnect=1&resize=scale"
+  log "    logs       : ${LOG_DIR}/*.log"
+  log "    shell      : docker exec -it -u omarchy <container> bash"
+  log "======================================================================"
+}
+
+# =============================================================================
+# main
+# =============================================================================
+NOVNC_READY=0
+
+main() {
+  load_config
+  setup_privilege
+
+  # `docker run ... omarchy:4.0.1 <cmd>` runs <cmd> as omarchy instead of the
+  # desktop. Useful for `bash`, `pacman -Syu`, CI checks.
+  if (( $# > 0 )); then
+    setup_runtime_dir
+    export_common_env
+    log "argv given; executing as ${OMARCHY_USER} instead of starting the desktop: $*"
+    cd "$OMARCHY_HOME" 2>/dev/null || cd /
+    exec "${PRIV_PREFIX[@]}" "$@"
+  fi
+
+  parse_resolution
+  check_port "$OMARCHY_VNC_PORT" OMARCHY_VNC_PORT
+  check_port "$OMARCHY_NOVNC_PORT" OMARCHY_NOVNC_PORT
+  if [[ "$OMARCHY_VNC_PORT" == "$OMARCHY_NOVNC_PORT" ]]; then
+    die "OMARCHY_VNC_PORT and OMARCHY_NOVNC_PORT are both ${OMARCHY_VNC_PORT}"
+  fi
+
+  setup_runtime_dir
+  export_common_env
+  start_dbus
+  select_compositor
+  strip_file_caps
+  [[ "$COMPOSITOR" == "hyprland" ]] && start_seatd
+  generate_configs
+  clean_stale_session
+  cd "$OMARCHY_HOME" 2>/dev/null || cd /
+  start_compositor
+  resolve_output
+  start_wayvnc
+  start_novnc
+  start_omarchy_shell
+  banner
+
+  # ---- supervise --------------------------------------------------------
+  # As PID 1 we must reap orphans too. bash's SIGCHLD handling reaps any child,
+  # including re-parented ones; `wait -n` wakes us for each of them. `-p` (bash
+  # 5.1+) tells us exactly which pid exited so we do not have to guess.
+  local have_wait_p=0
+  (( BASH_VERSINFO[0] > 5 || ( BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1 ) )) && have_wait_p=1
+  local rc exited_pid name
+  while (( ! SHUTTING_DOWN )); do
+    exited_pid=''
+    if (( have_wait_p )); then
+      wait -n -p exited_pid; rc=$?
+    else
+      wait -n; rc=$?
+    fi
+    (( SHUTTING_DOWN )) && break
+    if [[ -n "$exited_pid" ]]; then
+      # We know exactly who died and with what status.
+      for name in "${SVC_NAMES[@]}"; do
+        if [[ "${SVC_PID[$name]}" == "$exited_pid" ]]; then
+          service_died "$name" "$rc"
+          break
+        fi
+      done
+      # An unknown pid is a reaped orphan — a child of the compositor, or one of
+      # our log-prefixing process substitutions. Reaping it was the whole point.
+    else
+      # Either bash is too old for `wait -n -p`, or we were woken without a
+      # death (a trapped signal). Deduce from the process table instead; this is
+      # also the path that catches a child killed by a signal. Deliberately NOT
+      # keyed off `rc`, because rc>128 is ambiguous between "woken by a signal"
+      # and "a child was killed by a signal".
+      reap_children
+    fi
+    any_service_alive || die "every supervised process has exited" 1
+  done
+  shutdown 0
+}
+
+main "$@"

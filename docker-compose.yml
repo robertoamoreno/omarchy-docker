@@ -1,0 +1,121 @@
+# Omarchy 4.0.1 in a container — runtime service.
+#
+# The image is NOT built by compose. It is built by `build/build-image.sh`
+# (loop-mounts the ISO read-only, pacman-installs from the ISO's [offline]
+# mirror, then `tar | docker import`). There is no Dockerfile and no build
+# context, deliberately: a build context would have to contain the 6.2 GB ISO.
+#
+#   make build     -> produces omarchy:4.0.1
+#   make run       -> this file
+#
+# WHAT RUNS ON macOS:
+# Hyprland needs a DRM node AND an EGL device that reports a DRM device file.
+# No VM on an Apple Silicon Mac provides the second one (vkms has no render
+# node, so mesa enumerates only a software EGL device). The entrypoint probes
+# for this with omarchy-egl-probe and starts sway instead, so the container
+# comes up and VNC works -- you just get sway rather than Hyprland. Run
+# `make compositor` to see which was chosen and why. Full measurement in
+# docs/RESEARCH.md section 12.
+#
+# To get real Hyprland: an x86_64 Linux host with a GPU, plus
+#   devices: ["/dev/dri:/dev/dri"]   and   group_add: ["video", "render"]
+# uncommented below.
+
+services:
+  omarchy:
+    image: ${OMARCHY_IMAGE:-omarchy:4.0.1}
+    platform: linux/amd64          # everything Omarchy ships is x86_64 only
+    container_name: omarchy
+    hostname: omarchy
+    init: true                     # PID 1 reaper: Hyprland/uwsm/pipewire fork a
+                                   # lot of children and the entrypoint is a
+                                   # plain shell script, not a supervisor
+    restart: "no"                  # a desktop session; do not resurrect it silently
+
+    # Published on 127.0.0.1 by default: with OMARCHY_VNC_PASSWORD empty there
+    # is NO authentication on 5900. Set OMARCHY_BIND_ADDR=0.0.0.0 only if you
+    # also set a password or put this behind a tunnel.
+    # wayvnc itself always binds 0.0.0.0 *inside* the container — it has to, or
+    # port publishing cannot reach it.
+    ports:
+      - "${OMARCHY_BIND_ADDR:-127.0.0.1}:${OMARCHY_VNC_PORT:-5900}:${OMARCHY_VNC_PORT:-5900}"
+      - "${OMARCHY_BIND_ADDR:-127.0.0.1}:${OMARCHY_NOVNC_PORT:-6080}:${OMARCHY_NOVNC_PORT:-6080}"
+
+    environment:
+      OMARCHY_RESOLUTION:   "${OMARCHY_RESOLUTION:-1920x1080}"
+      OMARCHY_VNC_PORT:     "${OMARCHY_VNC_PORT:-5900}"
+      OMARCHY_NOVNC_PORT:   "${OMARCHY_NOVNC_PORT:-6080}"
+      OMARCHY_VNC_PASSWORD: "${OMARCHY_VNC_PASSWORD:-}"   # empty = no auth
+      OMARCHY_ENABLE_NOVNC: "${OMARCHY_ENABLE_NOVNC:-1}"
+      # auto | hyprland | sway. 'auto' runs omarchy-egl-probe and picks Hyprland
+      # only if mesa exposes a DRM-backed EGL device; otherwise sway. Forcing
+      # 'hyprland' on a host without one gives a live socket and a black screen.
+      OMARCHY_COMPOSITOR:   "${OMARCHY_COMPOSITOR:-auto}"
+      OMARCHY_DEBUG:        "${OMARCHY_DEBUG:-0}"
+      OMARCHY_STARTUP_TIMEOUT: "${OMARCHY_STARTUP_TIMEOUT:-60}"
+
+    # Chromium, Electron apps and Qt/quickshell put shared surfaces in /dev/shm.
+    # Docker's 64 MB default makes Chromium tab-crash immediately. This is a
+    # tmpfs ceiling, not an allocation — lower to 512m on a small Docker VM.
+    shm_size: "2gb"
+
+    # User state (dotfiles, ~/.config/omarchy, yay build cache, Chromium
+    # profile) must survive `make stop` and image rebuilds. On first `up` Docker
+    # seeds the volume from the image's /home/omarchy, so the shipped Omarchy
+    # dotfiles are preserved. `make clean` deletes it.
+    volumes:
+      - omarchy-home:/home/omarchy
+
+    # /run must be a fresh tmpfs: XDG_RUNTIME_DIR=/run/user/1000 lives there and
+    # the entrypoint recreates it 0700 omarchy:omarchy on every start. exec is
+    # needed because makepkg/yay drop helper scripts under /tmp; mode=1777 for
+    # /tmp is the normal sticky-bit world-writable mode.
+    tmpfs:
+      - /run:exec,mode=0755,size=256m
+      - /tmp:exec,mode=1777,size=1g
+
+    security_opt:
+      # Docker's default seccomp profile is wrong for this workload in three
+      # separate ways:
+      #  1. amd64-under-Rosetta/qemu trips it — pacman's alpm sandbox dies with
+      #     "error restricting syscalls via seccomp: 22!" (observed).
+      #  2. Chromium's namespace sandbox needs clone(CLONE_NEWUSER)/unshare.
+      #  3. libalpm tries to self-restrict via seccomp+landlock.
+      # Replace with a custom profile if you need one; this is the only
+      # confinement knob the runtime relaxes.
+      - seccomp=unconfined
+      # On AppArmor hosts (Ubuntu/Debian) the docker-default profile blocks the
+      # mount() and ptrace() calls Chromium's sandbox makes. Uncomment there.
+      # - apparmor=unconfined
+
+    # No cap_add. The RUNTIME needs no extra capabilities: seatd, wayvnc,
+    # Hyprland and pipewire all run fine unprivileged once /dev/dri is present.
+    # (The BUILDER is different — build/build-image.sh needs a privileged
+    # container to loop-mount the ISO and the squashfs. That privilege stops at
+    # build time and must not leak into this service.)
+
+    # --- DRM / GPU: REQUIRED for Hyprland to start at all -------------------
+    # Uncomment on an x86_64 Linux host. With no real GPU: `sudo modprobe vkms`
+    # first, which creates a virtual card. group_add must name the numeric GID
+    # that owns /dev/dri/renderD128 on the HOST (`stat -c %g /dev/dri/renderD128`),
+    # because the host's video/render GIDs do not match Arch's.
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - "44"    # host 'video'  — replace with your host's numeric GID
+    #   - "104"   # host 'render' — replace with your host's numeric GID
+    # -----------------------------------------------------------------------
+
+    healthcheck:
+      # wayvnc listening is the earliest honest signal that the session is up.
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/${OMARCHY_VNC_PORT:-5900}'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s      # cold start: seatd -> Hyprland -> wayvnc -> noVNC
+
+    stop_grace_period: 15s   # let Hyprland tear the session down before SIGKILL
+
+volumes:
+  omarchy-home:
+    name: omarchy-home

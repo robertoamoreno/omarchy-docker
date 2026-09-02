@@ -1,0 +1,2 @@
+# Drop executables here to have them run inside the session at startup.
+# See /etc/omarchy-container/autostart.sh.

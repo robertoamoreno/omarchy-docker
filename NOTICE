@@ -1,0 +1,20 @@
+This project packages Omarchy into a container. It contains no Omarchy source
+code and redistributes no Omarchy binaries.
+
+  Omarchy — https://omarchy.org  ·  https://github.com/basecamp/omarchy
+  Copyright (c) Basecamp / David Heinemeier Hansson. MIT licensed.
+
+What this repo contains is a build harness: scripts that read an Omarchy
+installer ISO you supply yourself, install packages from the offline pacman
+mirror that ISO already carries, and configure the result to run headless in a
+container. The ISO is NOT included and is excluded by .gitignore.
+
+Packages installed at build time come from:
+  * the ISO's own bundled offline mirror (Arch + Omarchy packages), and
+  * the Arch Linux Archive snapshot matching the ISO's build date, for the
+    handful of packages the mirror does not carry (wayvnc, neatvnc, aml,
+    vulkan-swrast, sway, swaybg).
+
+Those packages remain under their respective upstream licenses. noVNC (MPL-2.0)
+and websockify (LGPL-3.0) are downloaded from their upstream release tarballs at
+build time and are likewise not redistributed here.
