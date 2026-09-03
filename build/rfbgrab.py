@@ -63,9 +63,25 @@ for attempt in range(6):
     incremental = 0
     s.sendall(struct.pack(">BBHHHH", 3, incremental, 0, 0, w, h))
     msg = recvn(1)[0]
-    if msg != 0:
-        print("unexpected server msg type %d, skipping" % msg)
-        continue
+    # A server message that is not a FramebufferUpdate MUST still be drained --
+    # skipping the type byte alone leaves its body in the stream and every
+    # subsequent read is misaligned, which surfaces as absurd "encodings" like
+    # 0x61722070 (ASCII 'ar p'). A live desktop reliably sends these: type 3 is
+    # ServerCutText, emitted as soon as anything touches the clipboard.
+    while msg != 0:
+        if msg == 1:      # SetColourMapEntries
+            recvn(1)
+            _first, ncolours = struct.unpack(">HH", recvn(4))
+            recvn(ncolours * 6)
+        elif msg == 2:    # Bell - no body
+            pass
+        elif msg == 3:    # ServerCutText
+            recvn(3)
+            n = struct.unpack(">I", recvn(4))[0]
+            recvn(n)
+        else:
+            raise SystemExit("unknown server message type %d; stream state unknown" % msg)
+        msg = recvn(1)[0]
     recvn(1)
     nrects = struct.unpack(">H", recvn(2))[0]
     print("attempt %d: %d rects" % (attempt, nrects))
@@ -75,8 +91,25 @@ for attempt in range(6):
     for _ in range(nrects):
         rx, ry, rw, rh = struct.unpack(">HHHH", recvn(8))
         enc = struct.unpack(">i", recvn(4))[0]
+        if enc == 1:                       # CopyRect
+            sx, sy = struct.unpack(">HH", recvn(4))
+            for row in range(rh):
+                src = ((sy + row) * w + sx) * 4
+                dst = ((ry + row) * w + rx) * 4
+                fb[dst:dst + rw * 4] = fb[src:src + rw * 4]
+            got_pixels = True
+            continue
+        if enc == -223:                    # DesktopSize pseudo-encoding
+            w, h = rw, rh
+            fb = bytearray(w * h * 4)
+            continue
+        if enc < 0:                        # other pseudo-encodings carry no data
+            continue
         if enc != 0:
-            raise SystemExit("server used encoding %d, expected Raw(0)" % enc)
+            raise SystemExit(
+                "server used encoding %d; only Raw/CopyRect are advertised. "
+                "If this is a real encoding the server should not have chosen "
+                "it -- suspect a desynchronised stream." % enc)
         data = recvn(rw * rh * 4)
         got_pixels = True
         for row in range(rh):

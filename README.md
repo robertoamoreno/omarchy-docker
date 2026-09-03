@@ -1,4 +1,4 @@
-# Omarchy 4.0.1 in a container
+# Omarchy in a container
 
 > ## ⚠️ EXPERIMENTAL — read this before using it
 >
@@ -8,9 +8,12 @@
 > unverified elsewhere."
 >
 > Specifically:
-> - **It does not run Hyprland on most hosts.** Omarchy's own compositor needs a
->   GPU with a DRM render node; without one the image falls back to **sway**. A
->   plain cloud VM does not have one either. See *Which compositor you get*.
+> - **The Hyprland path has never been executed.** Not once. Omarchy's own
+>   compositor needs a GPU with a DRM render node (or a VM with virgl), and no
+>   such host was available while this was written — every test took the **sway**
+>   fallback. The code is there and the detection is verified; the Hyprland
+>   branch itself is untested. If you have capable hardware, please run
+>   `make verify-hyprland` and open an issue with what breaks.
 > - **Not hardened.** VNC has **no authentication by default**, runs as a
 >   passwordless-sudo user, and is only safe because compose binds to
 >   `127.0.0.1`. Do not expose it without reading *Configuration* first.
@@ -35,8 +38,16 @@ running in Docker, reachable over VNC and in a browser.
 > excluded by `.gitignore` -- download it from [omarchy.org](https://omarchy.org)
 > and drop it in the repo root. Nothing here redistributes Omarchy; this is a
 > build harness that reads an ISO you already have. See [NOTICE](NOTICE).
+>
+> **Any release works, not just the one this was written against.** The build
+> discovers `omarchy-*.iso` in the repo root, takes the image tag from the
+> filename (`omarchy-5.2.0.iso` -> `omarchy:5.2.0`), and derives the Arch Linux
+> Archive snapshot from the ISO's own `arch/version` so package versions always
+> match its bundled offline mirror. Several ISOs present? It refuses to guess --
+> pass `--iso`. Only `4.0.1` has actually been built and verified, so treat a
+> newer release as untested rather than unsupported.
 
-- Image: `omarchy:4.0.1`, `linux/amd64`, ~6.5 GiB unpacked (~4.6 GiB with `--slim`)
+- Image: `omarchy:<version-from-ISO>`, `linux/amd64`, ~6.5 GiB unpacked (~4.6 GiB with `--slim`)
 - Session: launched directly by the entrypoint -- there is no systemd, so no
   `uwsm` and no `sddm`. The compositor is chosen at startup by what the host can
   actually render (see **Which compositor you get** below): Hyprland 0.56.2 on a
@@ -212,11 +223,22 @@ $ docker compose exec omarchy omarchy-egl-probe -v
 
 Force either with `OMARCHY_COMPOSITOR=hyprland` / `=sway`.
 
-To get real Hyprland you need a host whose mesa exposes a DRM-backed EGL device
--- in practice an x86_64 Linux box with a GPU (`--device /dev/dri --group-add
-video`). **No VM on an Apple Silicon Mac can provide one**, including Colima with
-`modprobe vkms`: vkms has no render node, so mesa enumerates only a software
-device. The full measurement is in `docs/RESEARCH.md` section 12.
+To get real Hyprland you need a host whose mesa exposes a DRM-backed EGL device.
+Two ways to have one:
+
+1. **A real GPU** — an x86_64 Linux box with `--device /dev/dri --group-add video`.
+2. **A VM with virgl** — `virtio-gpu-gl` backed by virglrenderer gives the guest
+   a genuine render node. Plain `virtio-gpu` does not, and neither does `vkms`.
+
+What does NOT work, measured: `vkms` (no render node, so mesa enumerates only a
+software EGL device), `vgem` (no mesa driver), and Docker Desktop's linuxkit VM
+(no DRM at all). Colima/Lima's `vz` driver offers no virgl option, so on an Apple
+Silicon Mac this image falls back to sway. Details in `docs/RESEARCH.md` §12.
+
+> An earlier version of this file claimed "no VM on an Apple Silicon Mac can
+> provide one". That was wrong — it generalised from Colima to all VMs.
+> [try-omarchy](https://github.com/themartiano/try-omarchy) runs Hyprland on
+> Apple Silicon precisely by using QEMU with virgl. See **Prior art**.
 
 Container internals are fixed and everything in this repo agrees on them: user
 `omarchy` (uid/gid 1000, passwordless sudo), `$HOME=/home/omarchy`,
@@ -371,7 +393,8 @@ dependency of `libcups` and `tinysparql`. Its daemon is never enabled.
 
 ## Repo layout
 
-    omarchy-4.0.1.iso        the ISO you supply; read-only input, never copied
+    omarchy-*.iso            the ISO you supply; discovered automatically,
+                             read-only input, never copied or modified
     build/packages.conf      which packages go in, and why each exclusion
     build/verify-image.sh    proves the image renders (captures a frame, counts colours)
     build/rfbgrab.py         minimal RFB client used by verify-image.sh
@@ -390,3 +413,49 @@ This repo contains no Omarchy code and redistributes no Omarchy binaries; it
 builds from an ISO you supply. Omarchy is MIT licensed, copyright Basecamp /
 David Heinemeier Hansson — see [NOTICE](NOTICE) for the full attribution and
 the licenses of packages pulled in at build time.
+
+## Verifying the Hyprland path
+
+The sway path is verified end to end: `make verify` starts the image, captures a
+real frame over RFB and counts distinct colours (1594 on the reference run).
+
+The **Hyprland path is not verified**. To exercise it you need a host where mesa
+enumerates an EGL device with a DRM device file. Check yours:
+
+```
+make gpu-check
+```
+
+    EGL device[0]: DRM_DEVICE_FILE=/dev/dri/renderD128   <- Hyprland will run
+    EGL device[0]: DRM_DEVICE_FILE=(none)                <- sway fallback
+
+Qualifying hosts: a Linux box with a real GPU, or a VM with `virtio-gpu-gl`
+backed by virglrenderer. Then:
+
+```
+make verify-hyprland      # fails if it falls back to sway
+```
+
+Note that Homebrew's QEMU on macOS is built **without** virglrenderer and there
+is no `virglrenderer` formula, so this cannot be checked on a stock Mac — that is
+exactly why try-omarchy ships its own QEMU build.
+
+## Prior art
+
+**[try-omarchy](https://github.com/themartiano/try-omarchy)** solves the adjacent
+problem — running Omarchy *on a Mac* — and for that purpose it is better than
+this repo in every way that matters. It ships a signed macOS app: an aarch64 Arch
+Linux guest running upstream Omarchy, QEMU on Apple's Hypervisor Framework (so
+native ARM speed, no emulation), virtio-gpu + **virgl** through ANGLE to Metal,
+a native Cocoa window, working audio, clipboard, camera and shared folders.
+Because virgl gives the guest a real render node, **Hyprland actually renders**.
+
+If you want to use Omarchy on a Mac, use that, not this.
+
+This repo exists for a different job: Omarchy as a **container** — headless, on a
+server, in CI, in the cloud, composed with other services, built from the
+official released ISO rather than a source rebuild. It is ~340 KB of scripts
+with no app bundle, no code signing and no distribution story.
+
+Two things here were corrected by reading their work: that a VM *can* supply a
+render node (via virgl), and that the aarch64 route sidesteps emulation entirely.

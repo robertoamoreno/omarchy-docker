@@ -16,6 +16,23 @@ PORT="${VERIFY_PORT:-5999}"
 WEB_PORT="${VERIFY_WEB_PORT:-6099}"
 TIMEOUT="${VERIFY_TIMEOUT:-180}"
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# --require-hyprland: fail if the run falls back to sway. Use this on hardware
+# that should be able to render Hyprland (a GPU, or a VM with virtio-gpu-gl +
+# virglrenderer). Without it, verification passes on either compositor, which is
+# correct for CI-ish hosts but would silently let the Hyprland path rot.
+REQUIRE_HYPRLAND=0
+for a in "$@"; do
+  case "$a" in
+    --require-hyprland) REQUIRE_HYPRLAND=1 ;;
+    -h|--help)
+      sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      echo; echo "Options:"
+      echo "  --require-hyprland  fail unless the Hyprland path is exercised"
+      exit 0 ;;
+    *) echo "unknown option: $a" >&2; exit 2 ;;
+  esac
+done
 OUT="${VERIFY_OUT:-${HERE}/../verify-screenshot.ppm}"
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -79,12 +96,24 @@ done
 grn "wayvnc is serving RFB"
 
 say "which compositor was selected, and why"
+COMPOSITOR_SEEN=""
 docker exec "$NAME" omarchy-egl-probe -v 2>&1 | sed 's/^/    /' || true
 # -x matches the exact process name. Do NOT use -f here: Arch symlinks
 # /usr/sbin -> /usr/bin so the path in argv is /usr/sbin/sway (a "/usr/bin/sway"
 # pattern misses), and a -f pattern also matches the shell running the check
 # itself. Under Rosetta argv[0] is the translator but comm is still the binary.
+if docker exec "$NAME" pgrep -x Hyprland >/dev/null 2>&1; then COMPOSITOR_SEEN=Hyprland
+elif docker exec "$NAME" pgrep -x sway >/dev/null 2>&1; then COMPOSITOR_SEEN=sway; fi
 docker exec "$NAME" sh -c 'pgrep -ax Hyprland || pgrep -ax sway || echo "(no compositor process!)"' 2>&1 | sed 's/^/    /'
+
+if [ "$REQUIRE_HYPRLAND" = 1 ] && [ "$COMPOSITOR_SEEN" != "Hyprland" ]; then
+  red "FAIL (--require-hyprland) — this host ran '${COMPOSITOR_SEEN:-nothing}', not Hyprland."
+  echo "    The entrypoint only picks Hyprland when mesa exposes an EGL device"
+  echo "    with a DRM device file. Check with:"
+  echo "        docker run --rm --device /dev/dri $IMAGE omarchy-egl-probe -v"
+  echo "    You need a real GPU, or a VM with virtio-gpu-gl + virglrenderer."
+  exit 1
+fi
 
 # Give the compositor a moment to actually paint its first frames.
 sleep 5

@@ -11,17 +11,22 @@ SHELL := /usr/bin/env bash
 -include .env
 export
 
-IMAGE       ?= $(or $(OMARCHY_IMAGE),omarchy:4.0.1)
+PROJECT_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+
+# Follows whatever ISO is present, so a new release needs no edit here.
+# omarchy-5.2.0.iso -> omarchy:5.2.0. Override with IMAGE= or OMARCHY_IMAGE=.
+ISO_FOUND    := $(firstword $(wildcard $(PROJECT_DIR)/omarchy-*.iso) $(wildcard $(PROJECT_DIR)/*.iso))
+ISO_VERSION  := $(patsubst omarchy-%,%,$(basename $(notdir $(ISO_FOUND))))
+IMAGE        ?= $(or $(OMARCHY_IMAGE),omarchy:$(or $(ISO_VERSION),latest))
 SERVICE     ?= omarchy
-ISO         ?= omarchy-4.0.1.iso
+ISO         ?= $(notdir $(ISO_FOUND))
 VNC_PORT    ?= $(or $(OMARCHY_VNC_PORT),5900)
 WEB_PORT    ?= $(or $(OMARCHY_NOVNC_PORT),6080)
 export OMARCHY_IMAGE := $(IMAGE)
-PROJECT_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 ISO_PATH    := $(PROJECT_DIR)/$(ISO)
 DC          := docker compose
 
-.PHONY: help build run stop shell logs vnc web clean inspect-iso compositor
+.PHONY: help build run stop shell logs vnc web clean inspect-iso compositor verify verify-hyprland gpu-check
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -124,3 +129,17 @@ compositor: ## Show which compositor was selected and why
 	@# -x matches the exact process name. -f would both miss (/usr/sbin/sway,
 	@# since Arch symlinks /usr/sbin -> /usr/bin) and self-match the checking shell.
 	@$(DC) exec -T $(SERVICE) sh -c 'pgrep -ax Hyprland || pgrep -ax sway || echo "no compositor running"'
+
+verify: ## Prove the image renders: capture a frame over VNC, count colours
+	bash "$(PROJECT_DIR)/build/verify-image.sh"
+
+verify-hyprland: ## Same, but FAIL if it falls back to sway (needs a GPU or virgl)
+	bash "$(PROJECT_DIR)/build/verify-image.sh" --require-hyprland
+
+gpu-check: ## Can this host render Hyprland? (runs the same probe the entrypoint uses)
+	@docker image inspect "$(IMAGE)" >/dev/null 2>&1 || { echo "build the image first: make build"; exit 1; }
+	@echo "Host DRM devices:"
+	@docker run --rm --platform linux/amd64 alpine sh -c 'ls -la /dev/dri 2>/dev/null || echo "  none"' 2>/dev/null || true
+	@echo "EGL devices mesa enumerates (Hyprland needs one with a DRM device file):"
+	@docker run --rm --platform linux/amd64 $$([ -e /dev/dri ] && echo --device /dev/dri) \
+	  "$(IMAGE)" omarchy-egl-probe -v || true

@@ -23,6 +23,9 @@
 
 services:
   omarchy:
+    # The Makefile exports OMARCHY_IMAGE derived from whichever ISO is present
+    # (omarchy-5.2.0.iso -> omarchy:5.2.0), so this follows new releases. Set
+    # OMARCHY_IMAGE in .env if you run compose directly.
     image: ${OMARCHY_IMAGE:-omarchy:4.0.1}
     platform: linux/amd64          # everything Omarchy ships is x86_64 only
     container_name: omarchy

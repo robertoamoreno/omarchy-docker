@@ -26,3 +26,7 @@ rootfs-overlay/etc/omarchy-container/env.local
 *~
 .idea/
 .vscode/
+
+# Python bytecode (py_compile in CI/local checks)
+__pycache__/
+*.py[cod]

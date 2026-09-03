@@ -111,16 +111,28 @@ HEADLESS_OUTPUT="HEADLESS-1"
 DEFAULT_RESOLUTION="1920x1080"
 ENTRYPOINT_PATH="/usr/local/bin/omarchy-container-init"
 
-# ISO identity (verified 2026-08-30 by direct inspection).
-ISO_BASENAME="omarchy-4.0.1.iso"
-ISO_SIZE_BYTES=6227752960
-ISO_SHA256="69cbb4e10d98ad831c3c9f245b5757a9d1fedfd0c9592780e977d6f950dea8c3"
+# ISO identity. NOT pinned to one release: the ISO is discovered at run time and
+# its version, and the Arch Linux Archive snapshot date, are derived from it.
+# These constants describe only the ONE ISO this was developed against, and are
+# used for an advisory "known-good" note -- never as a gate, or no other release
+# could ever build.
+KNOWN_ISO_BASENAME="omarchy-4.0.1.iso"
+KNOWN_ISO_SIZE_BYTES=6227752960
+KNOWN_ISO_SHA256="69cbb4e10d98ad831c3c9f245b5757a9d1fedfd0c9592780e977d6f950dea8c3"
+ISO_PATH_FLAG=""          # --iso
+ISO_VERSION=""            # derived from the filename
+ISO_SHA256=""             # computed, or read from a sidecar <iso>.sha256
 
 # Arch Linux Archive snapshot pinned to the ISO's own build date (arch/version =
 # 2026.08.25). Single-quoted: $repo/$arch are pacman variables, not shell ones.
 # These are only FALLBACKS — build/packages.conf is the source of truth and
 # overrides them via OMARCHY_ALA_SNAPSHOT / OMARCHY_ALA_SERVER.
+# Default only. Unless overridden, this is DERIVED from the ISO's own
+# arch/version once the ISO is mounted -- a newer release ships a newer date and
+# must pin to the matching archive snapshot, or you get version skew against the
+# offline mirror (or packages that simply are not in that snapshot yet).
 ALA_DATE="2026/08/25"
+ALA_DATE_EXPLICIT=0
 # shellcheck disable=SC2016
 ALA_SERVER='https://archive.archlinux.org/repos/2026/08/25/$repo/os/$arch'
 MIRROR_PATH="/mnt/root/var/cache/omarchy/mirror/offline"
@@ -137,6 +149,7 @@ WEBSOCKIFY_VERSION="0.12.0"
 # ---------------------------------------------------------------------------
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_NAME="$IMAGE_NAME_DEFAULT"
+TAG_EXPLICIT=0
 BUILDER_NAME="omarchy-builder"
 BASE_IMAGE="archlinux:latest"
 MIN_FREE_GIB=17           # peak is ~15.7 GiB; 17 leaves a real margin
@@ -186,7 +199,8 @@ die()  {
 
 usage() {
   cat <<EOF
-build-image.sh — build ${IMAGE_NAME_DEFAULT} (${PLATFORM}) from ./${ISO_BASENAME}
+build-image.sh — build an Omarchy container image (${PLATFORM}) from an
+               Omarchy installer ISO found in the repo root.
 
   --dry-run                 run preflight and print the plan, then stop
   --emit-inner FILE         write the generated in-container build script to FILE
@@ -210,6 +224,12 @@ build-image.sh — build ${IMAGE_NAME_DEFAULT} (${PLATFORM}) from ./${ISO_BASENA
   --skip-overlay-check      do not fail when rootfs-overlay/ has no entrypoint
   --keep-caps               do not strip file capabilities outside Docker's
                             default bounding set (see notes in this script)
+  --iso PATH                use this ISO instead of auto-discovering one in the
+                            repo root. Required if several ISOs are present.
+  --ala-date YYYY/MM/DD     pin the Arch Linux Archive snapshot. Default: derived
+                            from the ISO's own arch/version, which is correct for
+                            any release. Override only to work around a bad day
+                            in the archive.
   --tag NAME:TAG            image tag to produce           (default ${IMAGE_NAME_DEFAULT})
   --builder-name NAME       builder container name         (default ${BUILDER_NAME})
   --base-image IMAGE        builder base image             (default ${BASE_IMAGE})
@@ -239,7 +259,9 @@ while [ $# -gt 0 ]; do
     --skip-sha)            SKIP_SHA=1 ;;
     --skip-overlay-check)  SKIP_OVERLAY_CHECK=1 ;;
     --keep-caps)           KEEP_CAPS=1 ;;
-    --tag)                 IMAGE_NAME="${2:?--tag needs a value}"; shift ;;
+    --tag)                 IMAGE_NAME="${2:?--tag needs a value}"; TAG_EXPLICIT=1; shift ;;
+    --iso)                 ISO_PATH_FLAG="${2:?--iso needs a path}"; shift ;;
+    --ala-date)            ALA_DATE="${2:?--ala-date needs YYYY/MM/DD}"; ALA_DATE_EXPLICIT=1; shift ;;
     --builder-name)        BUILDER_NAME="${2:?--builder-name needs a value}"; shift ;;
     --base-image)          BASE_IMAGE="${2:?--base-image needs a value}"; shift ;;
     --min-free-gib)        MIN_FREE_GIB="${2:?--min-free-gib needs a value}"; MIN_FREE_EXPLICIT=1; shift ;;
@@ -249,15 +271,75 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-ISO_PATH="$REPO_DIR/$ISO_BASENAME"
+# --- ISO discovery -----------------------------------------------------------
+# Deliberately NOT pinned to one filename: a newer Omarchy release should build
+# without editing this script. Exactly one candidate is required, so an ambiguous
+# directory fails loudly rather than silently picking the wrong release.
+discover_iso() {
+  if [ -n "$ISO_PATH_FLAG" ]; then
+    ISO_PATH="$ISO_PATH_FLAG"
+    [ -f "$ISO_PATH" ] || die "--iso: no such file: $ISO_PATH"
+    return
+  fi
+  local found=""  count=0  f
+  # NOTE: `for p in <glob1> <glob2>` expands BOTH globs up front, so the loop
+  # variable is a FILE, not a pattern -- an earlier version of this broke out
+  # after the first file and silently picked one of several ISOs. Collect each
+  # glob separately instead.
+  for f in "$REPO_DIR"/omarchy-*.iso; do
+    [ -f "$f" ] || continue
+    found="$found $f"; count=$(( count + 1 ))
+  done
+  # Only fall back to any *.iso if no omarchy-named one exists.
+  if [ "$count" -eq 0 ]; then
+    for f in "$REPO_DIR"/*.iso; do
+      [ -f "$f" ] || continue
+      found="$found $f"; count=$(( count + 1 ))
+    done
+  fi
+  if [ "$count" -eq 0 ]; then
+    die "no ISO found in $REPO_DIR
+
+     Download an Omarchy installer ISO from https://omarchy.org and put it in
+     the repo root, or point at one explicitly:
+         ./build/build-image.sh --iso /path/to/omarchy-X.Y.Z.iso"
+  fi
+  if [ "$count" -gt 1 ]; then
+    die "found $count ISOs in $REPO_DIR:
+$(for f in $found; do printf '       %s\n' "$(basename "$f")"; done)
+     Pick one explicitly:  ./build/build-image.sh --iso <file>"
+  fi
+  # shellcheck disable=SC2086
+  set -- $found
+  ISO_PATH="$1"
+}
+discover_iso
+ISO_BASENAME="$(basename "$ISO_PATH")"
+
+# Version from the filename: omarchy-4.0.1.iso -> 4.0.1. Only used for the
+# default image tag, so a weird filename degrades to a sane fallback.
+ISO_VERSION="$(printf '%s' "$ISO_BASENAME" | sed -n 's/^omarchy-\(.*\)\.iso$/\1/p')"
+[ -n "$ISO_VERSION" ] || ISO_VERSION="$(printf '%s' "$ISO_BASENAME" | sed 's/\.iso$//')"
+IMAGE_NAME_DEFAULT="omarchy:${ISO_VERSION}"
+# --tag still wins; otherwise the tag follows the ISO so two releases can coexist.
+[ "$TAG_EXPLICIT" = 1 ] || IMAGE_NAME="$IMAGE_NAME_DEFAULT"
+ok "ISO: ${ISO_BASENAME}  ->  version ${ISO_VERSION}, image ${IMAGE_NAME}"
 OVERLAY_DIR="$REPO_DIR/rootfs-overlay"
 PACKAGES_CONF="$REPO_DIR/build/packages.conf"
 
 # ---------------------------------------------------------------------------
 # Cleanup trap — the builder must die even on failure, Ctrl-C included.
 # ---------------------------------------------------------------------------
+CLEANUP_DONE=0
 cleanup() {
-  local rc=$?
+  # The signal traps call this and then exit, which fires the EXIT trap too, so
+  # guard against running the whole thing (and printing "build FAILED") twice.
+  if [ "$CLEANUP_DONE" = 1 ]; then exit "${1:-$?}"; fi
+  CLEANUP_DONE=1
+  # $1 lets the signal traps force a status. In a SIGINT/SIGTERM-triggered trap
+  # $? is the status of the last COMPLETED command -- almost always 0 -- so an
+  # interrupted build would exit 0 and report success to make/CI.
+  local rc=${1:-$?}
   set +e
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then rm -rf "$TMP_DIR"; fi
   if [ "$BUILDER_STARTED" = 1 ]; then
@@ -285,7 +367,9 @@ cleanup() {
   fi
   exit "$rc"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -338,14 +422,14 @@ fi
 [ -f "$ISO_PATH" ] || die "ISO not found at $ISO_PATH"
 ACTUAL_SIZE="$(file_size "$ISO_PATH")"
 [ -n "$ACTUAL_SIZE" ] || die "could not stat $ISO_PATH"
-if [ "$ACTUAL_SIZE" != "$ISO_SIZE_BYTES" ]; then
-  die "ISO size mismatch.
-       expected: $ISO_SIZE_BYTES bytes
-       actual:   $ACTUAL_SIZE bytes
-       path:     $ISO_PATH
-     This is not the Omarchy 4.0.1 ISO this build was verified against."
+if [ "$ACTUAL_SIZE" = "$KNOWN_ISO_SIZE_BYTES" ]; then
+  ok "ISO size $ACTUAL_SIZE bytes (matches the known-good $KNOWN_ISO_BASENAME)"
+else
+  ok "ISO size $ACTUAL_SIZE bytes"
+  info "note: differs from $KNOWN_ISO_BASENAME, the only release this was tested"
+  info "against. That is expected for a newer ISO; the build derives everything"
+  info "it needs from the ISO itself, but treat the result as unverified."
 fi
-ok "ISO size $ACTUAL_SIZE bytes"
 
 if [ "$SKIP_SHA" = 1 ]; then
   warn "sha256 check skipped (--skip-sha)"
@@ -356,11 +440,23 @@ else
   else ACTUAL_SHA=""; warn "neither shasum nor sha256sum found; cannot verify"
   fi
   if [ -n "$ACTUAL_SHA" ]; then
-    [ "$ACTUAL_SHA" = "$ISO_SHA256" ] || die "ISO sha256 mismatch.
-       expected: $ISO_SHA256
-       actual:   $ACTUAL_SHA
-       path:     $ISO_PATH"
-    ok "ISO sha256 ${ISO_SHA256:0:16}..."
+    ISO_SHA256="$ACTUAL_SHA"
+    # If upstream shipped a checksum next to the ISO, honour it. This is the
+    # only sha gate that generalises across releases.
+    for sidecar in "${ISO_PATH}.sha256" "${ISO_PATH%.iso}.sha256"; do
+      [ -f "$sidecar" ] || continue
+      EXPECT_SHA="$(awk '{print $1; exit}' "$sidecar")"
+      [ "$ACTUAL_SHA" = "$EXPECT_SHA" ] || die "ISO sha256 does not match $sidecar
+       expected: $EXPECT_SHA
+       actual:   $ACTUAL_SHA"
+      ok "ISO sha256 verified against $(basename "$sidecar")"
+      break
+    done
+    if [ "$ACTUAL_SHA" = "$KNOWN_ISO_SHA256" ]; then
+      ok "ISO sha256 ${ACTUAL_SHA:0:16}... (the known-good $KNOWN_ISO_BASENAME)"
+    else
+      ok "ISO sha256 ${ACTUAL_SHA:0:16}..."
+    fi
   fi
 fi
 
@@ -396,7 +492,7 @@ ok "packages.conf: base=${#OMARCHY_PKGS_BASE[@]} desktop=${#OMARCHY_PKGS_DESKTOP
 # packages.conf is the source of truth for the repos too — take its values over
 # this script's fallbacks, so there is exactly one place to bump the snapshot.
 if [ -n "${OMARCHY_ALA_SERVER:-}" ];        then ALA_SERVER="$OMARCHY_ALA_SERVER"; fi
-if [ -n "${OMARCHY_ALA_SNAPSHOT:-}" ];      then ALA_DATE="$OMARCHY_ALA_SNAPSHOT"; fi
+if [ -n "${OMARCHY_ALA_SNAPSHOT:-}" ];      then ALA_DATE="$OMARCHY_ALA_SNAPSHOT"; ALA_DATE_EXPLICIT=1; fi
 if [ -n "${OMARCHY_OFFLINE_REPO_PATH:-}" ]; then MIRROR_PATH="$OMARCHY_OFFLINE_REPO_PATH"; fi
 info "repos: [offline] file://$MIRROR_PATH/ + ALA $ALA_DATE"
 
@@ -590,7 +686,11 @@ OLD_IMAGE_ID=""
 OLD_IMAGE_GIB=0
 if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
   OLD_IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$IMAGE_NAME")"
-  OLD_IMAGE_GIB=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE_NAME") / 1073741824 ))
+  # .Size under the containerd snapshotter is the COMPRESSED BLOB only; the
+  # store keeps the unpacked snapshot too, so real on-disk cost is ~3.4x that.
+  # Under-reporting here made the gate refuse a second build that would in fact
+  # have had plenty of room once the old image was deleted.
+  OLD_IMAGE_GIB=$(( $(docker image inspect -f '{{.Size}}' "$IMAGE_NAME") * 34 / 10 / 1073741824 ))
   if [ "$KEEP_OLD_IMAGE" = 1 ]; then
     warn "$IMAGE_NAME already exists (~${OLD_IMAGE_GIB} GiB) and --keep-old-image was given; it will be left dangling after import"
   else
@@ -614,14 +714,22 @@ if [ "$DO_PRUNE" = 1 ]; then
   ok "after prune: ${VM_FREE_GIB} GiB free"
 fi
 
-if [ "$VM_FREE_GIB" -lt "$MIN_FREE_GIB" ]; then
+# Credit the old image: if we are about to delete it (KEEP_OLD_IMAGE=0), that
+# space becomes available before the import needs it. Without this the gate
+# refuses every rebuild after the first success.
+EFFECTIVE_FREE_GIB="$VM_FREE_GIB"
+if [ -n "$OLD_IMAGE_ID" ] && [ "$KEEP_OLD_IMAGE" != 1 ]; then
+  EFFECTIVE_FREE_GIB=$(( VM_FREE_GIB + OLD_IMAGE_GIB ))
+  info "counting the ~${OLD_IMAGE_GIB} GiB old image as reclaimable -> ${EFFECTIVE_FREE_GIB} GiB effective"
+fi
+if [ "$EFFECTIVE_FREE_GIB" -lt "$MIN_FREE_GIB" ]; then
   RECLAIM="$(docker system df 2>/dev/null | sed 's/^/         /')"
   die "not enough free space in the Docker VM.
 
        required: ${MIN_FREE_GIB} GiB   (peak during import is ~15.7 GiB:
                                   6.5 rootfs + 2.7 layer blob + 6.5 snapshot)
-       free:     ${VM_FREE_GIB} GiB
-       short by: $(( MIN_FREE_GIB - VM_FREE_GIB )) GiB
+       free:     ${VM_FREE_GIB} GiB (effective ${EFFECTIVE_FREE_GIB} GiB after reclaim)
+       short by: $(( MIN_FREE_GIB - EFFECTIVE_FREE_GIB )) GiB
 
      Reclaimable right now:
 $RECLAIM
@@ -700,6 +808,7 @@ INNER="$TMP_DIR/inner.sh"
   printf 'MIRROR=%q\n'            "$MIRROR_PATH"
   printf 'ALA_SERVER=%q\n'        "$ALA_SERVER"
   printf 'ALA_DATE=%q\n'          "$ALA_DATE"
+  printf 'ALA_DATE_EXPLICIT=%q\n' "$ALA_DATE_EXPLICIT"
   printf 'C_USER=%q\n'            "$CONTAINER_USER"
   printf 'C_UID=%q\n'             "$CONTAINER_UID"
   printf 'C_GID=%q\n'             "$CONTAINER_GID"
@@ -772,6 +881,35 @@ mark_mount /mnt/iso
 SFS=/mnt/iso/arch/x86_64/airootfs.sfs
 [ -f "$SFS" ] || idie "airootfs.sfs not found at $SFS — wrong ISO layout"
 iinfo "iso mounted, airootfs.sfs = $(stat -c %s "$SFS") bytes"
+
+# The ISO states its own build date in arch/version (e.g. "2026.08.25"). That is
+# exactly the Arch Linux Archive snapshot whose package versions match the
+# bundled offline mirror, so derive the pin from it rather than hardcoding one
+# release's date. Without this, a newer ISO would be built against an old
+# snapshot: wrong versions at best, missing packages at worst.
+if [ "${ALA_DATE_EXPLICIT:-0}" = 1 ]; then
+  iinfo "ALA snapshot $ALA_DATE (pinned explicitly, not derived)"
+elif [ -f /mnt/iso/arch/version ]; then
+  ISO_BUILD_DATE="$(tr -d ' \t\r\n' < /mnt/iso/arch/version)"
+  case "$ISO_BUILD_DATE" in
+    [0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9])
+      DERIVED_ALA="$(printf '%s' "$ISO_BUILD_DATE" | tr '.' '/')"
+      if [ "$DERIVED_ALA" != "$ALA_DATE" ]; then
+        iinfo "ISO arch/version = $ISO_BUILD_DATE -> ALA snapshot $DERIVED_ALA (was $ALA_DATE)"
+      else
+        iinfo "ISO arch/version = $ISO_BUILD_DATE -> ALA snapshot $DERIVED_ALA"
+      fi
+      ALA_DATE="$DERIVED_ALA"
+      ALA_SERVER="https://archive.archlinux.org/repos/${ALA_DATE}/\$repo/os/\$arch"
+      ;;
+    *)
+      iwarn "arch/version is '$ISO_BUILD_DATE', not YYYY.MM.DD; keeping ALA $ALA_DATE"
+      iwarn "if the VNC layer fails to resolve, pass --ala-date YYYY/MM/DD"
+      ;;
+  esac
+else
+  iwarn "no arch/version in the ISO; keeping ALA $ALA_DATE (pass --ala-date to override)"
+fi
 
 istep "loop-mounting airootfs.sfs (squashfs/zstd, read-only)"
 if ! mountpoint -q /mnt/root; then
@@ -1408,13 +1546,16 @@ fi
 # --privileged is required for loop-mounting the ISO and the squashfs. It also
 # turns off seccomp/apparmor, which is what makes pacman's scriptlets work under
 # Rosetta (though --disable-sandbox is still mandatory).
+# Set BEFORE the run: if the daemon creates the container but fails to start it,
+# set -e would exit with the flag still 0 and leak a created container. cleanup
+# is idempotent (docker rm -f ... 2>/dev/null), so an over-eager flag is free.
+BUILDER_STARTED=1
 docker run -d \
   --name "$BUILDER_NAME" \
   --platform "$PLATFORM" \
   --privileged \
   -v "$REPO_DIR:/repo:ro" \
   "$BASE_IMAGE" sleep infinity >/dev/null
-BUILDER_STARTED=1
 ok "builder '$BUILDER_NAME' running ($PLATFORM, --privileged, /repo read-only)"
 
 docker exec "$BUILDER_NAME" mkdir -p /work >/dev/null
@@ -1441,6 +1582,31 @@ step "importing the rootfs into $IMAGE_NAME"
 if [ -n "$OLD_IMAGE_ID" ] && [ "$KEEP_OLD_IMAGE" = 0 ]; then
   info "deleting the previous $IMAGE_NAME (~${OLD_IMAGE_GIB} GiB) to make room"
   docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1 || warn "could not remove the old $IMAGE_NAME; continuing"
+fi
+
+# The disk gate in preflight ran hundreds of lines ago, before the rootfs
+# existed. The import is the moment of PEAK usage and the destructive failure
+# mode (a full VM disk mid-import), so re-measure against the real rootfs size
+# now rather than trusting an estimate made before anything was installed.
+ROOTFS_MIB="$(docker exec "$BUILDER_NAME" du -sxm --exclude=var/cache/pacman/pkg /rootfs 2>/dev/null | awk '{print $1}')"
+if [ -n "$ROOTFS_MIB" ] && [ "$ROOTFS_MIB" -gt 0 ] 2>/dev/null; then
+  # Measured multiplier: the containerd store keeps BOTH the compressed blob
+  # (~0.41x) and the unpacked snapshot (~1.00x), so the import needs ~1.41x the
+  # rootfs on top of the rootfs already sitting in the builder. +1 GiB slack.
+  NEED_MIB=$(( ROOTFS_MIB * 141 / 100 + 1024 ))
+  NOW_KB="$(docker run --rm --platform "$PLATFORM" "$BASE_IMAGE" sh -c 'df -kP / | tail -1' 2>/dev/null | awk '{print $4}')"
+  NOW_MIB=$(( ${NOW_KB:-0} / 1024 ))
+  info "pre-import check: rootfs ${ROOTFS_MIB} MiB, import needs ~${NEED_MIB} MiB, free ${NOW_MIB} MiB"
+  if [ "$NOW_MIB" -lt "$NEED_MIB" ]; then
+    die "not enough room to import, and stopping now is the safe outcome.
+
+       rootfs:        ${ROOTFS_MIB} MiB
+       import needs:  ${NEED_MIB} MiB  (blob ~0.41x + unpacked snapshot ~1.00x + 1 GiB slack)
+       free:          ${NOW_MIB} MiB
+
+     Failing here leaves the builder intact. Re-run with --slim, or free space,
+     then re-run. Do NOT prune docker volumes to make room."
+  fi
 fi
 
 info "streaming tar -> docker import. Nothing is written to the host filesystem;"

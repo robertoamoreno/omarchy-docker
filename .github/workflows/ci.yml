@@ -1,0 +1,90 @@
+name: ci
+
+# Cheap static checks only. The real build needs a privileged container, an
+# ~6 GB ISO and ~12 GB of disk, so it cannot run here -- see build/verify-image.sh
+# for the check that actually proves the image renders.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n (parse every shell script)
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            if bash -n "$f" 2>err.txt; then
+              echo "  ok    $f"
+            else
+              echo "  FAIL  $f"; sed 's/^/        /' err.txt; fail=1
+            fi
+          done < <(grep -rIl '^#!/usr/bin/env bash\|^#!/bin/bash' . --exclude-dir=.git)
+          exit $fail
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1091: sourced files live in the image, not the repo.
+          # SC2181: the scripts check $? deliberately in places.
+          shellcheck -S warning -e SC1091,SC2181 \
+            build/build-image.sh build/verify-image.sh \
+            rootfs-overlay/usr/local/bin/omarchy-container-init \
+            rootfs-overlay/etc/omarchy-container/autostart.sh \
+            rootfs-overlay/etc/omarchy-container/statusbar.sh \
+          || echo "::warning::shellcheck reported findings (non-blocking)"
+
+      - name: packages.conf is valid shell and defines what the build needs
+        run: |
+          bash -n build/packages.conf
+          # shellcheck disable=SC1091
+          . build/packages.conf
+          for v in OMARCHY_PKGS_BASE OMARCHY_PKGS_DESKTOP OMARCHY_PKGS_VNC OMARCHY_PKGS_FALLBACK; do
+            eval "n=\${#$v[@]}"
+            [ "$n" -gt 0 ] || { echo "::error::$v is empty"; exit 1; }
+            echo "  $v: $n entries"
+          done
+
+      - name: python syntax
+        run: python3 -B -m py_compile build/rfbgrab.py   # -B: no __pycache__
+
+      - name: build script --help and arg parsing
+        run: |
+          bash build/build-image.sh --help >/dev/null && echo "  --help ok"
+          # An unknown flag must fail, not silently proceed.
+          if bash build/build-image.sh --definitely-not-a-flag >/dev/null 2>&1; then
+            echo "::error::unknown flags are not rejected"; exit 1
+          fi
+          echo "  rejects unknown flags"
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config parses
+        run: docker compose -f docker-compose.yml config >/dev/null && echo "  ok"
+      - name: Makefile parses and every documented target exists
+        run: |
+          make -n help >/dev/null
+          for t in build run stop shell logs vnc web clean compositor inspect-iso; do
+            make -n "$t" >/dev/null 2>&1 || echo "::warning::target '$t' not runnable in CI (may need docker/ISO)"
+          done
+          echo "  ok"
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no ISO, no secrets, no personal paths committed
+        run: |
+          fail=0
+          if git ls-files | grep -qiE '\.iso$'; then echo "::error::an ISO is committed"; fail=1; fi
+          if git grep -nIE '(BEGIN [A-Z ]*PRIVATE KEY|api[_-]?key *=|/Users/[a-z]+/)' -- . ; then
+            echo "::error::possible secret or personal path committed"; fail=1
+          fi
+          exit $fail
