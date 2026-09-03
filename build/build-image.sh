@@ -332,14 +332,16 @@ PACKAGES_CONF="$REPO_DIR/build/packages.conf"
 # ---------------------------------------------------------------------------
 CLEANUP_DONE=0
 cleanup() {
-  # The signal traps call this and then exit, which fires the EXIT trap too, so
-  # guard against running the whole thing (and printing "build FAILED") twice.
-  if [ "$CLEANUP_DONE" = 1 ]; then exit "${1:-$?}"; fi
-  CLEANUP_DONE=1
-  # $1 lets the signal traps force a status. In a SIGINT/SIGTERM-triggered trap
-  # $? is the status of the last COMPLETED command -- almost always 0 -- so an
-  # interrupted build would exit 0 and report success to make/CI.
+  # $? MUST be captured on the very first line. Any command before this --
+  # including `[ ... ]` and even a plain assignment -- overwrites it, which is
+  # exactly how an earlier version of this guard made EVERY failed build exit 0.
+  # $1 lets the signal traps force a status, because in a signal-triggered trap
+  # $? is the last COMPLETED command's status, almost always 0.
   local rc=${1:-$?}
+  # The signal traps call this and then exit, firing the EXIT trap too; run the
+  # body (and print "build FAILED") only once.
+  if [ "$CLEANUP_DONE" = 1 ]; then exit "$rc"; fi
+  CLEANUP_DONE=1
   set +e
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then rm -rf "$TMP_DIR"; fi
   if [ "$BUILDER_STARTED" = 1 ]; then
@@ -423,7 +425,10 @@ fi
 ACTUAL_SIZE="$(file_size "$ISO_PATH")"
 [ -n "$ACTUAL_SIZE" ] || die "could not stat $ISO_PATH"
 if [ "$ACTUAL_SIZE" = "$KNOWN_ISO_SIZE_BYTES" ]; then
-  ok "ISO size $ACTUAL_SIZE bytes (matches the known-good $KNOWN_ISO_BASENAME)"
+  # Size alone proves nothing: 4.0.2 is byte-for-byte the same SIZE as 4.0.1
+  # (6227752960) with a different sha256 and a different build date. Only claim
+  # a match once the sha agrees too, which happens further down.
+  ok "ISO size $ACTUAL_SIZE bytes"
 else
   ok "ISO size $ACTUAL_SIZE bytes"
   info "note: differs from $KNOWN_ISO_BASENAME, the only release this was tested"
@@ -594,6 +599,16 @@ if [ ${#OMARCHY_PKGS_VNC_URL[@]} -eq 0 ] && [ ${#OMARCHY_PKGS_VNC_PRESEED[@]} -e
   OMARCHY_PKGS_VNC_PRESEED=( aml )
   warn "packages.conf declares no ALA preseed; defaulting to 'aml' (the known poisoned package)"
 fi
+for _u in ${OMARCHY_PKGS_VNC_URL[@]+"${OMARCHY_PKGS_VNC_URL[@]}"}; do
+  case "$_u" in
+    *"repos//"*|*'${OMARCHY_ALA_SNAPSHOT}'*|*'$OMARCHY_ALA_SNAPSHOT'*)
+      die "OMARCHY_PKGS_VNC_URL contains an unexpanded or empty snapshot date:
+       $_u
+     The snapshot is derived from the ISO at build time, so it is NOT available
+     when packages.conf is sourced. Use OMARCHY_PKGS_VNC_PRESEED=( name ) and
+     let the build resolve the URL from the synced db." ;;
+  esac
+done
 ok "ALA preseed: ${#OMARCHY_PKGS_VNC_URL[@]} explicit URL(s), ${#OMARCHY_PKGS_VNC_PRESEED[@]} by name"
 
 # --- overlay --------------------------------------------------------------
