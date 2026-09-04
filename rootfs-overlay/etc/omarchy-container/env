@@ -90,6 +90,12 @@ export OMARCHY_VNC_USERNAME="${OMARCHY_VNC_USERNAME:-omarchy}"
 # D-Bus), audio (no pipewire daemon). Set to 0 for a bare compositor.
 OMARCHY_SHELL="${OMARCHY_SHELL:-1}"
 
+# Seconds to wait for quickshell's IPC before carrying on. Under emulation with
+# a fresh $HOME it routinely needs 60-90s; 30 was too short and left the desktop
+# showing both Omarchy's bar and the fallback swaybar. The entrypoint keeps
+# watching in the background even if this deadline passes.
+OMARCHY_SHELL_TIMEOUT="${OMARCHY_SHELL_TIMEOUT:-120}"
+
 # Root of the Omarchy tree the shell and its scripts read.
 export OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
 

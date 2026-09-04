@@ -314,6 +314,7 @@ apply_defaults() {
   : "${OMARCHY_VNC_PASSWORD:=}"
   : "${OMARCHY_MAX_FPS:=30}"
   : "${OMARCHY_SHELL:=1}"
+  : "${OMARCHY_SHELL_TIMEOUT:=120}"
   : "${OMARCHY_PATH:=/usr/share/omarchy}"
   export OMARCHY_PATH
   : "${OMARCHY_VNC_USERNAME:=omarchy}"
@@ -1139,7 +1140,11 @@ start_omarchy_shell() {
   #    running" even though the process is alive. Self-inflicted deadlock.
   #  * -q is documented as "return success even when the shell ... is
   #    unavailable", so a -q ping can never fail and gates nothing.
-  if wait_for 30 "the Omarchy shell to answer IPC" \
+  # 30s is not enough on a cold start: under emulation, with a fresh $HOME,
+  # quickshell needs well over a minute before its IPC answers. When this
+  # deadline fired early the shell came up anyway -- but the swaybar hide below
+  # never ran, so the desktop showed TWO stacked bars.
+  if wait_for "$OMARCHY_SHELL_TIMEOUT" "the Omarchy shell to answer IPC" \
        as_user sh -c "XDG_RUNTIME_DIR=${RUNTIME_DIR} omarchy-shell shell ping >/dev/null 2>&1"; then
     OMARCHY_SHELL_READY=1
     log "Omarchy shell up (quickshell); omarchy plugin/menu commands will work"
@@ -1150,8 +1155,23 @@ start_omarchy_shell() {
         && log "hid the fallback swaybar in favour of Omarchy's" || true
     fi
   else
-    warn "the Omarchy shell did not answer IPC in 30s; continuing without it"
-    warn "  'omarchy plugin list' will report: omarchy-shell is not running"
+    warn "the Omarchy shell did not answer IPC in ${OMARCHY_SHELL_TIMEOUT}s."
+    warn "  It may still be starting -- quickshell is slow under emulation."
+    # Do not give up: keep watching in the background so the fallback bar is
+    # hidden whenever the shell does arrive. Otherwise a slow start leaves two
+    # bars stacked for the life of the session.
+    (
+      for _ in $(seq 1 60); do
+        sleep 5
+        if as_user sh -c "XDG_RUNTIME_DIR=${RUNTIME_DIR} omarchy-shell shell ping >/dev/null 2>&1"; then
+          log "Omarchy shell came up late; hiding the fallback swaybar"
+          if [[ "$COMPOSITOR" == "wlroots" ]] && command -v swaymsg >/dev/null 2>&1; then
+            as_user sh -c "XDG_RUNTIME_DIR=$RUNTIME_DIR SWAYSOCK=\$(ls $RUNTIME_DIR/sway-ipc.* 2>/dev/null | head -1) swaymsg bar bar-0 mode invisible" >/dev/null 2>&1 || true
+          fi
+          exit 0
+        fi
+      done
+    ) &
   fi
 }
 

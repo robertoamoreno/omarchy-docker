@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# uwsm-app shim for the container.
+#
+# Omarchy launches essentially everything through `uwsm-app` -- 26 of its own
+# /usr/bin/omarchy-* scripts do, including every `omarchy install ...` that
+# opens the thing it just installed. uwsm-app puts the app in a systemd user
+# scope, so without a user manager it fails with:
+#
+#     Failed to connect to user scope bus via local transport: No such file or
+#     directory
+#
+# and, because callers background it with output discarded, the app silently
+# never appears. This image has no systemd by design (see
+# omarchy-container-init), so intercept the call and run the app directly.
+#
+# /usr/local/bin precedes /usr/sbin in PATH, so this shadows the real binary.
+# When a systemd user bus IS present (running this image on a systemd host, or
+# a future variant that boots one) we defer to the real uwsm-app instead, so
+# this degrades rather than diverges.
+set -euo pipefail
+
+REAL=""
+for c in /usr/bin/uwsm-app /usr/sbin/uwsm-app; do
+  [ -x "$c" ] && [ "$c" != "$(readlink -f "$0")" ] && REAL="$c" && break
+done
+
+# The real thing needs a systemd user bus. This is the exact condition it fails on.
+if [ -n "$REAL" ] && [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/systemd/private" ]; then
+  exec "$REAL" "$@"
+fi
+
+# Drop uwsm-app's own options; it accepts them before the command.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    -s|-a|-u|-t|-T|-C|-D|-A) shift 2 2>/dev/null || shift ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+
+[ $# -gt 0 ] || { echo "uwsm-app(shim): nothing to launch" >&2; exit 2; }
+
+# Refuse to launch a GUI app with no compositor to attach to. This matters more
+# than it looks: an Electron app started without WAYLAND_DISPLAY exits within
+# seconds AND leaves stale single-instance locks behind
+# (~/.config/<App>/SingletonCookie and SingletonSocket, symlinks into a /tmp
+# path that is already gone). Every later launch then dies with
+#     Failed to create .../SingletonLock: File exists (17)
+#     Failed to create a ProcessSingleton for your profile directory
+# even from a correct session -- so one bad launch poisons the app until those
+# locks are removed by hand. Failing fast here keeps that from happening.
+#
+# This is reachable in normal use: Omarchy's installers call uwsm-app to open
+# what they just installed, so `docker exec ... omarchy install ai chatgpt`
+# (no WAYLAND_DISPLAY) would otherwise poison the app it just installed.
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "${OMARCHY_ALLOW_NO_DISPLAY:-0}" != "1" ]; then
+  echo "uwsm-app(shim): refusing to launch '$1' -- no WAYLAND_DISPLAY or DISPLAY." >&2
+  echo "  A GUI app started without a compositor exits immediately and leaves" >&2
+  echo "  stale single-instance locks that block later launches." >&2
+  echo "  From outside the desktop, pass the session environment:" >&2
+  echo "    docker exec -e XDG_RUNTIME_DIR=/run/user/1000 -e WAYLAND_DISPLAY=wayland-1 ..." >&2
+  echo "  Set OMARCHY_ALLOW_NO_DISPLAY=1 to override." >&2
+  exit 3
+fi
+
+# A .desktop id (optionally with :action) needs a launcher, not exec.
+case "$1" in
+  *.desktop|*.desktop:*)
+    entry="${1%%:*}"
+    shift
+    if command -v gtk-launch >/dev/null 2>&1; then
+      exec gtk-launch "$entry" "$@"
+    elif command -v gio >/dev/null 2>&1; then
+      for d in "$HOME/.local/share/applications" /usr/local/share/applications /usr/share/applications; do
+        [ -f "$d/$entry" ] && exec gio launch "$d/$entry" "$@"
+      done
+    fi
+    echo "uwsm-app(shim): cannot launch desktop entry '$entry' (no gtk-launch/gio)" >&2
+    exit 127
+    ;;
+esac
+
+exec "$@"

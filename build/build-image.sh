@@ -1236,7 +1236,7 @@ grep -q '^DisableSandbox' "$ROOTFS/etc/pacman.conf" \
 # user installs later matches the offline mirror's versions exactly. The ALA URL
 # already uses $repo/$arch, so it drops straight into mirrorlist.
 cat > "$ROOTFS/etc/pacman.d/mirrorlist" <<EOF
-# Pinned to the Arch Linux Archive snapshot matching the Omarchy 4.0.1 ISO
+# Pinned to the Arch Linux Archive snapshot matching this ISO
 # (arch/version = ${ALA_DATE//\//.}). Zero version skew with the packages that
 # were installed from the ISO's offline mirror at build time.
 Server = $ALA_SERVER
@@ -1244,7 +1244,41 @@ Server = $ALA_SERVER
 # For a live, rolling mirror instead (WILL skew versions against the ISO set):
 #Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch
 EOF
-iinfo "hostname, locale, machine-id, DisableSandbox, pinned mirrorlist"
+# Omarchy's own packages live in its own repo, not in Arch's. Without this,
+# `omarchy install ai chatgpt` (and every other omarchy-pkg-add) dies with
+#     error: target not found: openai-codex-desktop
+# because openai-codex-desktop is in pkgs.omarchy.org, not core/extra. The ISO
+# installer configures this repo on a real install; the container needs it too.
+# Left unpinned deliberately: this repo publishes no dated snapshots, and its
+# packages are the point of running Omarchy at all.
+if ! grep -q '^\[omarchy\]' "$ROOTFS/etc/pacman.conf"; then
+  cat >> "$ROOTFS/etc/pacman.conf" <<'EOF'
+
+# Omarchy's own package repository. Signed by the omarchy-keyring package,
+# which is installed and populated into the image's pacman keyring at build.
+[omarchy]
+Server = https://pkgs.omarchy.org/$arch
+EOF
+fi
+grep -q '^\[omarchy\]' "$ROOTFS/etc/pacman.conf" \
+  || idie "failed to add the [omarchy] repo to the image's /etc/pacman.conf"
+
+# Initialise the pacman keyring so the repos above verify. The BUILD used
+# SigLevel = Never throughout (the offline mirror is unsigned in place and the
+# ALA keyring would not match), but the SHIPPED image must be able to install
+# packages normally -- and without this, in-container pacman fails at
+# "checking keyring" for anything it downloads.
+if chroot "$ROOTFS" /usr/bin/pacman-key --init >/dev/null 2>&1; then
+  if chroot "$ROOTFS" /usr/bin/pacman-key --populate archlinux omarchy >/dev/null 2>&1; then
+    iinfo "pacman keyring initialised and populated (archlinux + omarchy)"
+  else
+    iwarn "pacman-key --populate failed; in-container installs may need SigLevel=Never"
+  fi
+else
+  iwarn "pacman-key --init failed; in-container package installs will not verify"
+fi
+
+iinfo "hostname, locale, machine-id, DisableSandbox, mirrorlist, [omarchy] repo, keyring"
 
 # --------------------------------------------------------------------------
 istep "creating user $C_USER ($C_UID:$C_GID)"
@@ -1394,6 +1428,9 @@ fi
 # Package cache and sync dbs. The mirror bind is already unmounted (asserted
 # above), so this only touches real files.
 rm -rf "${ROOTFS:?}"/var/cache/pacman/pkg/* 2>/dev/null || true
+# NOTE: /var/lib/pacman/sync is repopulated after this strip (see the sync step
+# below). Clearing it here removes the build-time databases, which point at the
+# builder's file:// offline repo and are useless -- and misleading -- at runtime.
 rm -rf "${ROOTFS:?}"/var/lib/pacman/sync/*  2>/dev/null || true
 
 # .pacnew / .pacsave, logs, scratch.
@@ -1412,6 +1449,59 @@ SIZE_AFTER_MIB="$(du -sxm "$ROOTFS" 2>/dev/null | awk '{print $1}')"
 iinfo "size: ${SIZE_BEFORE_MIB} MiB -> ${SIZE_AFTER_MIB} MiB (saved $(( SIZE_BEFORE_MIB - SIZE_AFTER_MIB )) MiB)"
 
 # --------------------------------------------------------------------------
+istep "syncing pacman databases for the shipped image"
+# Without this the image ships with NO package databases and every install fails:
+#     warning: database file for 'omarchy' does not exist (use '-Sy' to download)
+#     error: target not found: openai-codex-desktop
+# omarchy-pkg-add does not sync first, and neither do most of Omarchy's own
+# installers, so `omarchy install ai chatgpt` dies on a fresh container.
+#
+# Do this with --root from the BUILDER, not `chroot $ROOTFS pacman`. The chroot
+# route needs three things the rootfs does not have at this point and each one
+# failed in turn: /proc (Rosetta reads /proc/self/exe to translate x86_64
+# binaries, and the strip step unmounted it -> "rosetta error: Unable to open
+# /proc/self/exe" + core dump), working DNS (a chroot has no usable
+# /etc/resolv.conf -> "Could not resolve host"), and a config whose Include
+# paths resolve. The builder already has all of it, and --root writes the
+# databases into the rootfs just the same. Costs ~9 MiB and makes the image
+# usable out of the box.
+#
+# A dedicated config: the image's own pacman.conf uses Include paths that would
+# resolve against the BUILDER's /etc, and the build-time config still knows
+# about the [offline] file:// repo, which is unmounted by now.
+cat > "$WORK/pacman-sync.conf" <<EOF
+[options]
+HoldPkg      = pacman glibc
+Architecture = x86_64
+SigLevel     = Never
+LocalFileSigLevel = Never
+DisableSandbox
+
+[core]
+Server = $ALA_SERVER
+
+[extra]
+Server = $ALA_SERVER
+
+[omarchy]
+Server = https://pkgs.omarchy.org/\$arch
+EOF
+
+if pacman --config "$WORK/pacman-sync.conf" \
+     --root "$ROOTFS" --dbpath "$ROOTFS/var/lib/pacman" \
+     -Sy --noconfirm >"$WORK/sync.log" 2>&1; then
+  SYNC_N="$(find "$ROOTFS/var/lib/pacman/sync" -name '*.db' 2>/dev/null | wc -l | tr -d ' ')"
+  SYNC_MIB="$(du -sxm "$ROOTFS/var/lib/pacman/sync" 2>/dev/null | awk '{print $1}')"
+  iinfo "synced ${SYNC_N} databases (${SYNC_MIB:-?} MiB): $(cd "$ROOTFS/var/lib/pacman/sync" && ls *.db 2>/dev/null | tr '\n' ' ')"
+  [ "${SYNC_N:-0}" -ge 3 ] \
+    || idie "expected core+extra+omarchy databases, got ${SYNC_N}. Without all three,
+       'omarchy install ...' fails with 'target not found' in the shipped image."
+else
+  iwarn "pacman -Sy failed; the image ships without databases and users will need"
+  iwarn "'sudo pacman -Sy' before any omarchy install command. Reason:"
+  sed 's/^/         /' "$WORK/sync.log" >&2 2>/dev/null || true
+fi
+
 istep "scrubbing file capabilities outside Docker's default bounding set"
 # --------------------------------------------------------------------------
 # Arch's /usr/bin/sway carries cap_sys_nice=ep, which is outside Docker's
@@ -1495,6 +1585,7 @@ assert_file /usr/bin/uwsm       "session manager"
 assert_file /usr/bin/quickshell "the Omarchy shell"
 assert_file /usr/bin/foot       "terminal"
 assert_file /usr/local/bin/omarchy-egl-probe "runtime compositor capability probe"
+assert_file /usr/local/bin/uwsm-app        "shim: Omarchy launches apps via uwsm-app, which needs systemd"
 assert_file /usr/bin/sway       "wlroots fallback compositor, for hosts with no DRM-backed EGL device"
 assert_file /usr/bin/seatd      "libseat backend; needed or the DRM backend never scans GPUs"
 assert_file /usr/bin/Xwayland   "X11 apps under Wayland"
@@ -1736,3 +1827,23 @@ cat <<EOF
   Build details:            /usr/share/omarchy-container/build-manifest.txt
 
 EOF
+
+# Record the tag so plain "docker compose up -d" works. Without it compose falls
+# back to the hardcoded default in docker-compose.yml, which may be a version
+# that no longer exists -- it then tries to PULL that tag from Docker Hub and
+# fails with "pull access denied". The Makefile passes the tag explicitly, but
+# compose invoked directly cannot know which ISO you built from.
+#
+# NOTE: this must stay OUTSIDE the heredoc above. An earlier version was
+# inserted inside it, where the assignment became literal text and the
+# backticks in its own comment were command-substituted -- which silently ran
+# a docker command in the middle of a build.
+ENV_FILE="$REPO_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+  grep -v '^OMARCHY_IMAGE=' "$ENV_FILE" > "$ENV_FILE.tmp" 2>/dev/null || : > "$ENV_FILE.tmp"
+  mv "$ENV_FILE.tmp" "$ENV_FILE"
+else
+  printf '# Written by build-image.sh; see .env.example for every knob.\n' > "$ENV_FILE"
+fi
+printf 'OMARCHY_IMAGE=%s\n' "$IMAGE_NAME" >> "$ENV_FILE"
+info "recorded OMARCHY_IMAGE=$IMAGE_NAME in .env so 'docker compose up' works"

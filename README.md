@@ -440,6 +440,45 @@ Note that Homebrew's QEMU on macOS is built **without** virglrenderer and there
 is no `virglrenderer` formula, so this cannot be checked on a stock Mac — that is
 exactly why try-omarchy ships its own QEMU build.
 
+## Installing software inside the desktop
+
+`omarchy install ...` works — `omarchy install ai chatgpt` is verified end to
+end, installing `openai-codex-desktop` and opening it on the desktop.
+
+Two things had to be true for that, and both are handled at build time:
+
+* **The `[omarchy]` repo is configured.** Omarchy's own packages are published
+  at `pkgs.omarchy.org`, not in Arch's `core`/`extra`. Without it you get
+  `error: target not found: openai-codex-desktop`. The pacman keyring is
+  initialised and populated (`archlinux` + `omarchy`) so those packages verify.
+* **`uwsm-app` is shimmed.** Omarchy launches apps through `uwsm-app`, which
+  places them in a systemd user scope — 26 of its own scripts do this, including
+  every installer that opens what it just installed. With no systemd the real
+  binary fails with `Failed to connect to user scope bus`, and since callers
+  background it with output discarded, the app silently never appears.
+  `/usr/local/bin/uwsm-app` runs the app directly instead, and defers to the
+  real binary if a systemd user bus ever exists.
+
+**Run installers from a terminal inside the desktop.** Omarchy's installers open
+what they just installed, and a GUI app started without `WAYLAND_DISPLAY` exits
+at once *and leaves stale Electron single-instance locks* that block every later
+launch with `Failed to create a ProcessSingleton`. The `uwsm-app` shim now
+refuses such launches rather than poisoning the app. To install from outside:
+
+```
+docker compose exec -e XDG_RUNTIME_DIR=/run/user/1000 -e WAYLAND_DISPLAY=wayland-1 \
+  omarchy omarchy install ai chatgpt
+```
+
+If you hit the lock before this was fixed:
+`rm -f ~/.config/<App>/Singleton*` inside the container.
+
+Caveat: `core`/`extra` are pinned to the ISO's archive snapshot, so Arch
+packages install at the versions the image was built against. That is
+deliberate — it keeps the installed set consistent — but it means
+`pacman -Syu` will not move you forward. Swap the commented live mirror in
+`/etc/pacman.d/mirrorlist` if you want a rolling system, and accept the skew.
+
 ## Prior art
 
 **[try-omarchy](https://github.com/themartiano/try-omarchy)** solves the adjacent
